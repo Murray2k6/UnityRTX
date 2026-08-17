@@ -13,8 +13,8 @@ namespace UnityRemix
         #region Version Constants
         
         public const uint REMIXAPI_VERSION_MAJOR = 0;
-        public const uint REMIXAPI_VERSION_MINOR = 6;
-        public const uint REMIXAPI_VERSION_PATCH = 2;
+        public const uint REMIXAPI_VERSION_MINOR = 1000;
+        public const uint REMIXAPI_VERSION_PATCH = 0;
 
         private const uint LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR = 0x00000100;
         private const uint LOAD_LIBRARY_SEARCH_DEFAULT_DIRS = 0x00001000;
@@ -86,11 +86,10 @@ namespace UnityRemix
             REMIXAPI_STRUCT_TYPE_STARTUP_INFO = 22,
             REMIXAPI_STRUCT_TYPE_PRESENT_INFO = 23,
             REMIXAPI_STRUCT_TYPE_DEPRECATED_LEGACY_PARTICLE_SYSTEM = 24,
-            REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SYSTEM_EXT = 25,
-            REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT = 26,
-            REMIXAPI_STRUCT_TYPE_TEXTURE_INFO = 27,
-            REMIXAPI_STRUCT_TYPE_FOG_INFO = 28,
-            REMIXAPI_STRUCT_TYPE_UI_DRAW_LIST = 29,
+            REMIXAPI_STRUCT_TYPE_TEXTURE_INFO = 25,
+            REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SYSTEM_EXT = 26,
+            REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT = 27,
+            REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_INFO = 28,
         }
 
         public enum remixapi_CameraType : int
@@ -589,6 +588,7 @@ namespace UnityRemix
             // Core functions
             public IntPtr Startup;               // PFN_remixapi_Startup
             public IntPtr Present;               // PFN_remixapi_Present
+            public IntPtr SetCameraMediumMaterial;
             public IntPtr GetUIState;
             public IntPtr SetUIState;
             // Optional extension functions (v0.5.1+)
@@ -596,11 +596,11 @@ namespace UnityRemix
             public IntPtr AutoInstancePersistentLights;
             public IntPtr UpdateLightDefinition;
             public IntPtr DrawScreenOverlay;
-            public IntPtr SetFogState;
-            public IntPtr SetScreenTint;
-            public IntPtr RegisterUITexture;
-            public IntPtr FreeUITexture;
-            public IntPtr SubmitUIDrawList;
+            public IntPtr SetGameValue;
+            public IntPtr RequestVramCompaction;
+            public IntPtr GetVramStats;
+            public IntPtr RequestTextureVramFree;
+            public IntPtr GetGameValue;
         }
 
         #endregion
