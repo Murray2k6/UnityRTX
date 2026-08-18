@@ -344,6 +344,7 @@ namespace UnityRemix
             public uint disableSrgbConversionForOutput; // remixapi_Bool
             public uint forceNoVkSwapchain;             // remixapi_Bool
             public uint editorModeEnabled;              // remixapi_Bool
+            public uint combineGuiInFinalColor;         // remixapi_Bool
         }
 
         [StructLayout(LayoutKind.Sequential)]
