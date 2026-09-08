@@ -880,7 +880,6 @@ namespace UnityRemix
             {
                 // Remove dynamic tags
                 cleanName = cleanName.Replace(" (Instance)", "").Replace(" Instance", "").Replace("(Clone)", "").Trim();
-                cleanName = System.Text.RegularExpressions.Regex.Replace(cleanName, @"[\s_-]*[0-9]+$", "");
                 foreach (char c in cleanName)
                 {
                     hash ^= c;

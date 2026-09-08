@@ -186,10 +186,7 @@ namespace UnityRemix
             if (renderer == null || mesh == null)
                 return false;
 
-            if (renderer.isPartOfStaticBatch)
-                return true;
-
-            return mesh.subMeshCount > 1;
+            return renderer.isPartOfStaticBatch;
         }
 
         private static int CountDistinctMaterials(Material[] materials)
