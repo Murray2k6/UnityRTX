@@ -57,8 +57,8 @@ namespace UnityRemix
         // Cache for game meshes - maps Unity mesh instance ID to Remix handle
         private ConcurrentDictionary<int, IntPtr> meshCache = new ConcurrentDictionary<int, IntPtr>();
         
-        // Cache for skinned mesh Remix handles - keyed by skinned renderer ID
-        private Dictionary<int, IntPtr> skinnedMeshHandles = new Dictionary<int, IntPtr>();
+        // Cache for skinned mesh Remix handles - keyed by Remix mesh hash
+        private Dictionary<ulong, IntPtr> skinnedMeshHandles = new Dictionary<ulong, IntPtr>();
         
         // Deferred destruction queue to prevent flickering (destroy handles after they're no longer in use)
         private Queue<IntPtr> deferredDestroyQueue = new Queue<IntPtr>();
@@ -78,7 +78,7 @@ namespace UnityRemix
             public int vertexCapacity;
             public int indexCapacity;
         }
-        private Dictionary<int, PinnedMeshData> pinnedMeshPool = new Dictionary<int, PinnedMeshData>();
+        private Dictionary<ulong, PinnedMeshData> pinnedMeshPool = new Dictionary<ulong, PinnedMeshData>();
         
         // Track logged material warnings to avoid spam
         private HashSet<string> loggedMaterialWarnings = new HashSet<string>();
@@ -127,9 +127,9 @@ namespace UnityRemix
         /// <summary>
         /// Get cached skinned mesh handle
         /// </summary>
-        public bool TryGetSkinnedMeshHandle(int meshId, out IntPtr handle)
+        public bool TryGetSkinnedMeshHandle(ulong meshHash, out IntPtr handle)
         {
-            return skinnedMeshHandles.TryGetValue(meshId, out handle);
+            return skinnedMeshHandles.TryGetValue(meshHash, out handle);
         }
         
         /// <summary>
@@ -327,7 +327,7 @@ namespace UnityRemix
         /// Create Remix mesh from skinned mesh data (for animated meshes)
         /// </summary>
         public IntPtr CreateRemixMeshFromData(
-            int meshId, 
+            ulong meshHash, 
             Vector3[] vertices, 
             Vector3[] normals, 
             Vector2[] uvs, 
@@ -342,7 +342,7 @@ namespace UnityRemix
             if (triangles.Length % 3 != 0)
             {
                 if (skinnedRenderCount % 300 == 1)
-                    logger.LogError($"Skinned mesh {meshId} has invalid triangle count: {triangles.Length}");
+                    logger.LogError($"Skinned mesh {meshHash} has invalid triangle count: {triangles.Length}");
                 return IntPtr.Zero;
             }
             
@@ -352,19 +352,16 @@ namespace UnityRemix
                 if (triangles[i] < 0 || triangles[i] >= vertices.Length)
                 {
                     if (skinnedRenderCount % 300 == 1)
-                        logger.LogError($"Skinned mesh {meshId} has out-of-bounds index");
+                        logger.LogError($"Skinned mesh {meshHash} has out-of-bounds index");
                     return IntPtr.Zero;
                 }
             }
-            
-            // Stable hash per skinned renderer — lets Remix track the mesh across frames
-            ulong dynamicHash = (ulong)unchecked((uint)meshId);
             
             // Ensure normals — compute from face geometry when unavailable
             if (normals == null || normals.Length != vertices.Length)
             {
                 normals = ComputeFaceNormals(vertices, triangles);
-                logger.LogDebug($"Skinned mesh {meshId}: normals missing, computed from face geometry");
+                logger.LogDebug($"Skinned mesh {meshHash}: normals missing, computed from face geometry");
             }
             
             // Ensure UVs
@@ -374,7 +371,7 @@ namespace UnityRemix
             }
             
             // Use pooled GCHandles
-            if (!pinnedMeshPool.TryGetValue(meshId, out PinnedMeshData poolData))
+            if (!pinnedMeshPool.TryGetValue(meshHash, out PinnedMeshData poolData))
             {
                 poolData = new PinnedMeshData
                 {
@@ -435,7 +432,7 @@ namespace UnityRemix
                 poolData.vertexHandle = GCHandle.Alloc(poolData.vertices, GCHandleType.Pinned);
                 poolData.indexHandle = GCHandle.Alloc(poolData.indices, GCHandleType.Pinned);
                 poolData.isPinned = true;
-                pinnedMeshPool[meshId] = poolData;
+                pinnedMeshPool[meshHash] = poolData;
             }
             
             // Get or create material handle for skinned mesh (on render thread)
@@ -446,7 +443,7 @@ namespace UnityRemix
             }
             
             // Create mesh
-            //logger.LogInfo($"Creating skinned mesh {meshId} with material: 0x{materialHandle.ToInt64():X}");
+            //logger.LogInfo($"Creating skinned mesh {meshHash} with material: 0x{materialHandle.ToInt64():X}");
             
             var surface = new RemixAPI.remixapi_MeshInfoSurfaceTriangles
             {
@@ -467,7 +464,7 @@ namespace UnityRemix
                 {
                     sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_MESH_INFO,
                     pNext = IntPtr.Zero,
-                    hash = dynamicHash,
+                    hash = meshHash,
                     surfaces_values = surfaceHandle.AddrOfPinnedObject(),
                     surfaces_count = 1
                 };
@@ -552,7 +549,7 @@ namespace UnityRemix
         /// Called once per unique sharedMesh. Returns mesh handle or IntPtr.Zero on failure.
         /// </summary>
         public IntPtr CreateSkinnedMeshWithBones(
-            int meshId,
+            ulong meshHash,
             Vector3[] vertices,
             Vector3[] normals,
             Vector2[] uvs,
@@ -565,8 +562,6 @@ namespace UnityRemix
         {
             if (vertices == null || vertices.Length == 0 || triangles == null || triangles.Length == 0)
                 return IntPtr.Zero;
-            
-            ulong meshHash = (ulong)unchecked((uint)meshId);
             
             if (normals == null || normals.Length != vertices.Length)
             {
@@ -651,7 +646,7 @@ namespace UnityRemix
                     
                     if (result != RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
                     {
-                        logger.LogWarning($"CreateSkinnedMeshWithBones failed for {meshId}: {result}");
+                        logger.LogWarning($"CreateSkinnedMeshWithBones failed for {meshHash}: {result}");
                         return IntPtr.Zero;
                     }
                     
@@ -768,10 +763,10 @@ namespace UnityRemix
         /// <summary>
         /// Manage skinned mesh handle lifecycle
         /// </summary>
-        public void UpdateSkinnedMeshHandle(int meshId, IntPtr newHandle)
+        public void UpdateSkinnedMeshHandle(ulong meshHash, IntPtr newHandle)
         {
             // Queue old handle for deferred destruction (prevents flickering)
-            if (skinnedMeshHandles.TryGetValue(meshId, out IntPtr oldHandle) && oldHandle != IntPtr.Zero)
+            if (skinnedMeshHandles.TryGetValue(meshHash, out IntPtr oldHandle) && oldHandle != IntPtr.Zero)
             {
                 // Don't destroy immediately - queue it for later
                 deferredDestroyQueue.Enqueue(oldHandle);
@@ -788,29 +783,29 @@ namespace UnityRemix
                 }
             }
             
-            skinnedMeshHandles[meshId] = newHandle;
+            skinnedMeshHandles[meshHash] = newHandle;
             skinnedRenderCount++;
         }
         
         /// <summary>
         /// Clean up stale skinned mesh handles
         /// </summary>
-        public void CleanupStaleSkinnedMeshes(HashSet<int> activeMeshIds)
+        public void CleanupStaleSkinnedMeshes(HashSet<ulong> activeMeshHashes)
         {
             if (destroyMeshFunc == null)
                 return;
             
-            List<int> toRemove = new List<int>();
+            List<ulong> toRemove = new List<ulong>();
             foreach (var kvp in skinnedMeshHandles)
             {
-                if (!activeMeshIds.Contains(kvp.Key))
+                if (!activeMeshHashes.Contains(kvp.Key))
                 {
                     destroyMeshFunc(kvp.Value);
                     toRemove.Add(kvp.Key);
                 }
             }
             
-            foreach (int id in toRemove)
+            foreach (ulong id in toRemove)
             {
                 skinnedMeshHandles.Remove(id);
             }

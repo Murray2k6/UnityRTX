@@ -509,6 +509,7 @@ namespace UnityRemix
         public struct SkinnedMeshData
         {
             public int meshId;
+            public ulong remixMeshHash;
             public int materialId;  // Unity material instance ID
             public Vector3[] vertices;
             public Vector3[] normals;
@@ -1117,6 +1118,7 @@ namespace UnityRemix
                     persistentSkinnedData[skinnedId] = new SkinnedMeshData
                     {
                         meshId = skinnedId,
+                        remixMeshHash = RemixMeshConverter.GenerateMeshHash(skinned.sharedMesh),
                         materialId = matId,
                         vertices = skinData.bindVertices,
                         normals = skinData.bindNormals,
@@ -1701,6 +1703,7 @@ namespace UnityRemix
                 persistentSkinnedData[skinnedId] = new SkinnedMeshData
                 {
                     meshId = skinnedId,
+                    remixMeshHash = RemixMeshConverter.GenerateMeshHash(skinned.sharedMesh),
                     materialId = matId,
                     vertices = verts,
                     normals = norms,

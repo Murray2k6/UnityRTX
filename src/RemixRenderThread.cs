@@ -362,7 +362,7 @@ namespace UnityRemix
             if (state.skinned == null || state.skinned.Count == 0)
                 return;
             
-            HashSet<int> updatedMeshes = new HashSet<int>();
+            HashSet<ulong> updatedMeshes = new HashSet<ulong>();
             uint objectPickingValue = startObjectPickingValue;
             
             foreach (var skinned in state.skinned)
@@ -374,11 +374,11 @@ namespace UnityRemix
                         // GPU skinning path: create mesh once with bone weights, draw with bone transforms each frame
                         IntPtr meshHandle;
                         if (!skinned.skinningData.meshCreated ||
-                            !meshConverter.TryGetSkinnedMeshHandle(skinned.meshId, out meshHandle) ||
+                            !meshConverter.TryGetSkinnedMeshHandle(skinned.remixMeshHash, out meshHandle) ||
                             meshHandle == IntPtr.Zero)
                         {
                             meshHandle = meshConverter.CreateSkinnedMeshWithBones(
-                                skinned.meshId,
+                                skinned.remixMeshHash,
                                 skinned.vertices,
                                 skinned.normals,
                                 skinned.uvs,
@@ -393,11 +393,11 @@ namespace UnityRemix
                             if (meshHandle == IntPtr.Zero)
                                 continue;
                             
-                            meshConverter.UpdateSkinnedMeshHandle(skinned.meshId, meshHandle);
+                            meshConverter.UpdateSkinnedMeshHandle(skinned.remixMeshHash, meshHandle);
                             skinned.skinningData.meshCreated = true;
                         }
                         
-                        updatedMeshes.Add(skinned.meshId);
+                        updatedMeshes.Add(skinned.remixMeshHash);
                         meshConverter.DrawSkinnedInstance(meshHandle, skinned.localToWorld, skinned.boneTransforms, objectPickingValue);
                         objectPickingValue++;
                     }
@@ -405,7 +405,7 @@ namespace UnityRemix
                     {
                         // BakeMesh fallback: recreate mesh each frame with new vertex data
                         IntPtr meshHandle = meshConverter.CreateRemixMeshFromData(
-                            skinned.meshId,
+                            skinned.remixMeshHash,
                             skinned.vertices,
                             skinned.normals,
                             skinned.uvs,
@@ -418,8 +418,8 @@ namespace UnityRemix
                         if (meshHandle == IntPtr.Zero)
                             continue;
                         
-                        meshConverter.UpdateSkinnedMeshHandle(skinned.meshId, meshHandle);
-                        updatedMeshes.Add(skinned.meshId);
+                        meshConverter.UpdateSkinnedMeshHandle(skinned.remixMeshHash, meshHandle);
+                        updatedMeshes.Add(skinned.remixMeshHash);
                         meshConverter.DrawMeshInstance(meshHandle, skinned.localToWorld, objectPickingValue);
                         objectPickingValue++;
                     }
