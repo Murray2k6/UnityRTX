@@ -566,8 +566,8 @@ namespace UnityRemix
                 if (!valid)
                     continue;
 
-                // Use filter instance ID in hash so each object gets its own Remix mesh + material binding
-                ulong meshHash = GenerateInstanceMeshHash(mesh, filterId);
+                // Use transform hierarchy in hash so each object gets its own persistent Remix mesh + material binding
+                ulong meshHash = GenerateInstanceMeshHash(mesh, filter.transform);
                 var dedupeKey = StaticGeometryDedupe.BuildKey(renderer, mesh);
 
                 if (colors != null && colors.Length > 0)
@@ -818,12 +818,12 @@ namespace UnityRemix
             }
         }
 
-        private static ulong GenerateInstanceMeshHash(Mesh mesh, int instanceId)
+        private static ulong GenerateInstanceMeshHash(Mesh mesh, Transform transform)
         {
             ulong hash = 14695981039346656037UL; // FNV offset basis
 
-            // Include instance ID so each object gets a unique Remix mesh
-            hash ^= (ulong)(uint)instanceId;
+            // Include transform hierarchy hash so each object gets a persistent unique Remix mesh
+            hash ^= HashUtils.GetHierarchyHash(transform);
             hash *= 1099511628211UL;
 
             if (!string.IsNullOrEmpty(mesh.name))

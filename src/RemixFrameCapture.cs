@@ -1036,13 +1036,13 @@ namespace UnityRemix
                 if (skinned == null || !skinned.enabled || !skinned.gameObject.activeInHierarchy)
                 {
                     // Log if this was a previously tracked mesh (helps debug disappearing geometry)
-                    if (configDebugLogInterval.Value > 0 && skinned != null && persistentSkinnedData.ContainsKey(skinned.GetInstanceID()))
-                        logger.LogWarning($"[SkinSkip] '{skinned.gameObject.name}' id={skinned.GetInstanceID()}: enabled={skinned.enabled}, activeInHierarchy={skinned.gameObject.activeInHierarchy}, activeSelf={skinned.gameObject.activeSelf}");
+                    if (configDebugLogInterval.Value > 0 && skinned != null && persistentSkinnedData.ContainsKey(HashUtils.GetHierarchyHashInt(skinned.transform)))
+                        logger.LogWarning($"[SkinSkip] '{skinned.gameObject.name}' id={HashUtils.GetHierarchyHashInt(skinned.transform)}: enabled={skinned.enabled}, activeInHierarchy={skinned.gameObject.activeInHierarchy}, activeSelf={skinned.gameObject.activeSelf}");
                     skipNull++;
                     continue;
                 }
                 
-                if (IsLayerDisabled(skinned.gameObject.layer) || IsRendererDisabled(skinned.GetInstanceID()))
+                if (IsLayerDisabled(skinned.gameObject.layer) || IsRendererDisabled(HashUtils.GetHierarchyHashInt(skinned.transform)))
                 {
                     skipLayer++;
                     continue;
@@ -1067,13 +1067,13 @@ namespace UnityRemix
                 
                 if (skinned.sharedMesh == null)
                 {
-                    if (configDebugLogInterval.Value > 0 && persistentSkinnedData.ContainsKey(skinned.GetInstanceID()))
-                        logger.LogWarning($"[SkinSkip] '{skinned.gameObject.name}' id={skinned.GetInstanceID()}: sharedMesh became NULL");
+                    if (configDebugLogInterval.Value > 0 && persistentSkinnedData.ContainsKey(HashUtils.GetHierarchyHashInt(skinned.transform)))
+                        logger.LogWarning($"[SkinSkip] '{skinned.gameObject.name}' id={HashUtils.GetHierarchyHashInt(skinned.transform)}: sharedMesh became NULL");
                     skipNoMesh++;
                     continue;
                 }
                 
-                int skinnedId = skinned.GetInstanceID();
+                int skinnedId = HashUtils.GetHierarchyHashInt(skinned.transform);
                 validSkinnedIds.Add(skinnedId);
                 
                 // Compute unscaled transform (sign-only scale preserves winding)
@@ -1795,7 +1795,7 @@ namespace UnityRemix
                             {
                                 mpbEmissiveColor = c;
                                 // Generate unique material ID for this renderer's override
-                                matId = HashCombine(bestMaterial.GetInstanceID(), skinned.GetInstanceID());
+                                matId = HashCombine(bestMaterial.GetInstanceID(), HashUtils.GetHierarchyHashInt(skinned.transform));
                             }
                         }
                         if (bestMaterial.HasProperty("_EmissiveIntensity"))

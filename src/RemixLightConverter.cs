@@ -144,7 +144,7 @@ namespace UnityRemix
                 {
                     sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_LIGHT_INFO,
                     pNext = IntPtr.Zero,
-                    hash = (ulong)light.GetInstanceID(),
+                    hash = HashUtils.GetHierarchyHash(light.transform),
                     radiance = radiance,
                     isDynamic = 1,
                     ignoreViewModel = 0
