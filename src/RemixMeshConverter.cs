@@ -818,48 +818,24 @@ namespace UnityRemix
         {
             ulong hash = 14695981039346656037UL; // FNV offset basis
             
+            string cleanName = mesh.name;
+            if (!string.IsNullOrEmpty(cleanName))
+            {
+                // Remove dynamic tags
+                cleanName = cleanName.Replace(" (Instance)", "").Replace(" Instance", "").Replace("(Clone)", "").Trim();
+                cleanName = System.Text.RegularExpressions.Regex.Replace(cleanName, @"[\s_-]*[0-9]+$", "");
+                foreach (char c in cleanName)
+                {
+                    hash ^= c;
+                    hash *= 1099511628211UL;
+                }
+            }
+            
             // Hash vertex count and triangle count
             hash ^= (ulong)mesh.vertexCount;
             hash *= 1099511628211UL;
             hash ^= (ulong)mesh.triangles.Length;
             hash *= 1099511628211UL;
-            
-            try
-            {
-                // Hash distributed vertices (up to 100 samples) to ensure unique geometry
-                var vertices = mesh.vertices;
-                if (vertices != null && vertices.Length > 0)
-                {
-                    int step = Math.Max(1, vertices.Length / 100);
-                    for (int i = 0; i < vertices.Length; i += step)
-                    {
-                        hash ^= (ulong)BitConverter.DoubleToInt64Bits(vertices[i].x);
-                        hash *= 1099511628211UL;
-                        hash ^= (ulong)BitConverter.DoubleToInt64Bits(vertices[i].y);
-                        hash *= 1099511628211UL;
-                        hash ^= (ulong)BitConverter.DoubleToInt64Bits(vertices[i].z);
-                        hash *= 1099511628211UL;
-                    }
-                }
-                
-                // Hash bind poses to ensure bone structures match
-                var bindPoses = mesh.bindposes;
-                if (bindPoses != null && bindPoses.Length > 0)
-                {
-                    hash ^= (ulong)bindPoses.Length;
-                    hash *= 1099511628211UL;
-                    for (int i = 0; i < bindPoses.Length; i++)
-                    {
-                        hash ^= (ulong)BitConverter.DoubleToInt64Bits(bindPoses[i].m03);
-                        hash *= 1099511628211UL;
-                        hash ^= (ulong)BitConverter.DoubleToInt64Bits(bindPoses[i].m13);
-                        hash *= 1099511628211UL;
-                        hash ^= (ulong)BitConverter.DoubleToInt64Bits(bindPoses[i].m23);
-                        hash *= 1099511628211UL;
-                    }
-                }
-            }
-            catch { }
             
             if (hash == 0) hash = 1;
             return hash;

@@ -1115,10 +1115,21 @@ namespace UnityRemix
                             : Matrix4x4.identity;
                     }
                     
-                    persistentSkinnedData[skinnedId] = new SkinnedMeshData
-                    {
-                        meshId = skinnedId,
-                        remixMeshHash = RemixMeshConverter.GenerateMeshHash(skinned.sharedMesh),
+                        ulong combinedMeshHash = RemixMeshConverter.GenerateMeshHash(skinned.sharedMesh);
+                        if (skinned.bones != null)
+                        {
+                            foreach (var b in skinned.bones)
+                            {
+                                if (b != null)
+                                    combinedMeshHash ^= HashUtils.HashStringFNV(b.name);
+                                combinedMeshHash *= 1099511628211UL;
+                            }
+                        }
+                        
+                        persistentSkinnedData[skinnedId] = new SkinnedMeshData
+                        {
+                            meshId = skinnedId,
+                            remixMeshHash = combinedMeshHash,
                         materialId = matId,
                         vertices = skinData.bindVertices,
                         normals = skinData.bindNormals,
@@ -1700,10 +1711,21 @@ namespace UnityRemix
                 }
                 catch { }
                 
+                ulong combinedMeshHash = RemixMeshConverter.GenerateMeshHash(skinned.sharedMesh);
+                if (skinned.bones != null)
+                {
+                    foreach (var b in skinned.bones)
+                    {
+                        if (b != null)
+                            combinedMeshHash ^= HashUtils.HashStringFNV(b.name);
+                        combinedMeshHash *= 1099511628211UL;
+                    }
+                }
+                
                 persistentSkinnedData[skinnedId] = new SkinnedMeshData
                 {
                     meshId = skinnedId,
-                    remixMeshHash = RemixMeshConverter.GenerateMeshHash(skinned.sharedMesh),
+                    remixMeshHash = combinedMeshHash,
                     materialId = matId,
                     vertices = verts,
                     normals = norms,
