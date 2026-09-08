@@ -1119,16 +1119,38 @@ namespace UnityRemix
         /// <summary>
         /// Generate material hash
         /// </summary>
-        public ulong GenerateMaterialHash(string materialName, int materialId)
+        public ulong GenerateMaterialHash(MaterialTextureData matData)
         {
-            string input = $"{materialName}_{materialId}";
-            
             ulong hash = 14695981039346656037UL;
-            foreach (char c in input)
+            
+            string cleanName = matData.materialName;
+            if (!string.IsNullOrEmpty(cleanName))
             {
-                hash ^= c;
-                hash *= 1099511628211UL;
+                cleanName = cleanName.Replace(" (Instance)", "").Replace(" Instance", "").Replace("(Clone)", "").Trim();
+                foreach (char c in cleanName)
+                {
+                    hash ^= c;
+                    hash *= 1099511628211UL;
+                }
             }
+            
+            // Hash textures
+            hash ^= matData.albedoTextureHash;
+            hash *= 1099511628211UL;
+            hash ^= matData.normalTextureHash;
+            hash *= 1099511628211UL;
+            hash ^= matData.emissiveTextureHash;
+            hash *= 1099511628211UL;
+            
+            // Hash emission
+            hash ^= (ulong)BitConverter.DoubleToInt64Bits(matData.emissiveColor.r);
+            hash *= 1099511628211UL;
+            hash ^= (ulong)BitConverter.DoubleToInt64Bits(matData.emissiveColor.g);
+            hash *= 1099511628211UL;
+            hash ^= (ulong)BitConverter.DoubleToInt64Bits(matData.emissiveColor.b);
+            hash *= 1099511628211UL;
+            hash ^= (ulong)BitConverter.DoubleToInt64Bits(matData.emissiveIntensity);
+            hash *= 1099511628211UL;
             
             if (hash == 0) hash = 1;
             return hash;
@@ -1351,7 +1373,7 @@ namespace UnityRemix
             {
                 string albedoPath = GetTexturePathFromHandle(matData.albedoHandle);
                 string normalPath = GetTexturePathFromHandle(matData.normalHandle);
-                ulong matHash = GenerateMaterialHash(matData.materialName, materialId);
+                ulong matHash = GenerateMaterialHash(matData);
                 
                 // Use debug placeholder for materials with no albedo texture
                 if (albedoPath == null)
