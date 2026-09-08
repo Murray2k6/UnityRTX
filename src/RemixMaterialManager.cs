@@ -1128,6 +1128,9 @@ namespace UnityRemix
             {
                 // Remove dynamic Unity tags
                 cleanName = cleanName.Replace(" (Instance)", "").Replace(" Instance", "").Replace("(Clone)", "").Trim();
+                // Remove trailing numbers and underscores/spaces (e.g. "Material_12345" -> "Material")
+                cleanName = System.Text.RegularExpressions.Regex.Replace(cleanName, @"[\s_-]*[0-9]+$", "");
+                
                 foreach (char c in cleanName)
                 {
                     hash ^= c;
