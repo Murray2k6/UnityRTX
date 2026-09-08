@@ -819,11 +819,9 @@ namespace UnityRemix
             ulong hash = 14695981039346656037UL; // FNV offset basis
             
             // Hash mesh name
-            string cleanName = mesh.name;
-            if (!string.IsNullOrEmpty(cleanName))
+            if (!string.IsNullOrEmpty(mesh.name))
             {
-                cleanName = cleanName.Replace(" (Instance)", "").Replace(" Instance", "").Replace("(Clone)", "").Trim();
-                foreach (char c in cleanName)
+                foreach (char c in mesh.name)
                 {
                     hash ^= c;
                     hash *= 1099511628211UL; // FNV prime
