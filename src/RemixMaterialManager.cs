@@ -1128,14 +1128,19 @@ namespace UnityRemix
             {
                 // Remove dynamic Unity tags
                 cleanName = cleanName.Replace(" (Instance)", "").Replace(" Instance", "").Replace("(Clone)", "").Trim();
-                // Remove trailing numbers and underscores/spaces (e.g. "Material_12345" -> "Material")
-                cleanName = System.Text.RegularExpressions.Regex.Replace(cleanName, @"[\s_-]*[0-9]+$", "");
                 
                 foreach (char c in cleanName)
                 {
                     hash ^= c;
                     hash *= 1099511628211UL;
                 }
+            }
+
+            // Factor in albedo texture hash so distinct texture assets never collide
+            if (matData.albedoHandle != IntPtr.Zero)
+            {
+                hash ^= (ulong)matData.albedoHandle.ToInt64();
+                hash *= 1099511628211UL;
             }
             
             // Incorporate emissive color directly since it's used for per-instance overrides
@@ -1368,6 +1373,13 @@ namespace UnityRemix
                 string albedoPath = GetTexturePathFromHandle(matData.albedoHandle);
                 string normalPath = GetTexturePathFromHandle(matData.normalHandle);
                 ulong matHash = GenerateMaterialHash(matData);
+                
+                string cleanMatName = matData.materialName;
+                if (!string.IsNullOrEmpty(cleanMatName))
+                {
+                    cleanMatName = cleanMatName.Replace(" (Instance)", "").Replace(" Instance", "").Replace("(Clone)", "").Trim();
+                }
+                logger.LogInfo($"[HashDebug-Material] materialId={materialId} rawName='{matData.materialName}' cleanedName='{cleanMatName}' emColor=({matData.emissiveColor.r:F3},{matData.emissiveColor.g:F3},{matData.emissiveColor.b:F3}) matHash=0x{matHash:X16}");
                 
                 // Use debug placeholder for materials with no albedo texture
                 if (albedoPath == null)

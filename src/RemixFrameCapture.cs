@@ -167,7 +167,7 @@ namespace UnityRemix
         private struct MeshToCreate
         {
             public Mesh mesh;
-            public Material material;
+            public Material[] materials;
         }
         private Queue<MeshToCreate> meshesToCreate = new Queue<MeshToCreate>();
         private HashSet<int> meshesInQueue = new HashSet<int>(); // Track which meshes are already queued
@@ -189,7 +189,7 @@ namespace UnityRemix
             if (renderer.isPartOfStaticBatch)
                 return true;
 
-            return mesh.subMeshCount > 1 && CountDistinctMaterials(renderer.sharedMaterials) > 1;
+            return mesh.subMeshCount > 1;
         }
 
         private static int CountDistinctMaterials(Material[] materials)
@@ -480,6 +480,7 @@ namespace UnityRemix
         
         // Track which renderers have had vertexBufferTarget configured
         private HashSet<int> configuredBufferTargets = new HashSet<int>();
+        private HashSet<string> loggedHashDebugMeshes = new HashSet<string>();
         
         // Track logged skinned mesh materials to avoid spam
         private HashSet<string> loggedSkinnedMaterials = new HashSet<string>();
@@ -599,6 +600,7 @@ namespace UnityRemix
             persistentSkinnedData.Clear();
             pendingReadbacks.Clear();
             configuredBufferTargets.Clear();
+            loggedHashDebugMeshes.Clear();
             cachedTopology.Clear();
             cachedSkinning.Clear();
             persistentStaticInstances.Clear();
@@ -818,20 +820,26 @@ namespace UnityRemix
                 if (needsQueue)
                 {
                     // Capture material textures (pixel data gathered here, Remix API deferred to render thread)
-                    var material = renderer.sharedMaterial;
-                    if (material != null)
+                    var materials = renderer.sharedMaterials;
+                    if (materials != null)
                     {
-                        int matId = material.GetInstanceID();
-                        materialManager.CaptureMaterialTextures(material, matId);
+                        for (int m = 0; m < materials.Length; m++)
+                        {
+                            if (materials[m] != null)
+                            {
+                                int matId = materials[m].GetInstanceID();
+                                materialManager.CaptureMaterialTextures(materials[m], matId);
+                            }
+                        }
                     }
                     
-                    // Queue mesh with its material
+                    // Queue mesh with its materials
                     lock (meshQueueLock)
                     {
                         meshesToCreate.Enqueue(new MeshToCreate
                         {
                             mesh = mesh,
-                            material = material
+                            materials = materials
                         });
                         meshesInQueue.Add(meshId);
                     }
@@ -974,8 +982,8 @@ namespace UnityRemix
                 
                 try
                 {
-                    // Create mesh with its material!
-                    IntPtr handle = meshConverter.CreateRemixMeshFromUnity(meshData.mesh, meshData.material);
+                    // Create mesh with its materials!
+                    IntPtr handle = meshConverter.CreateRemixMeshFromUnity(meshData.mesh, meshData.materials);
                     
                     if (handle == IntPtr.Zero)
                     {
@@ -1116,6 +1124,7 @@ namespace UnityRemix
                     }
                     
                         ulong combinedMeshHash = RemixMeshConverter.GenerateMeshHash(skinned.sharedMesh);
+                        ulong baseMeshHash = combinedMeshHash; // save for logging
                         if (skinned.bones != null)
                         {
                             foreach (var b in skinned.bones)
@@ -1124,6 +1133,20 @@ namespace UnityRemix
                                     combinedMeshHash ^= HashUtils.HashStringFNV(b.name);
                                 combinedMeshHash *= 1099511628211UL;
                             }
+                        }
+                        
+                        // Debug: log hash components once per unique mesh name
+                        string meshDebugKey = skinned.sharedMesh.name + "_gpu";
+                        if (!loggedHashDebugMeshes.Contains(meshDebugKey))
+                        {
+                            loggedHashDebugMeshes.Add(meshDebugKey);
+                            string meshName = skinned.sharedMesh.name;
+                            string cleanedName = meshName.Replace(" (Instance)", "").Replace(" Instance", "").Replace("(Clone)", "").Trim();
+                            cleanedName = System.Text.RegularExpressions.Regex.Replace(cleanedName, @"[\s_-]*[0-9]+$", "");
+                            int vertCount = skinned.sharedMesh.vertexCount;
+                            int triCount = skinned.sharedMesh.triangles.Length;
+                            string boneNames = skinned.bones != null ? string.Join(",", System.Linq.Enumerable.Select(skinned.bones, b => b != null ? b.name : "null")) : "none";
+                            logger.LogInfo($"[HashDebug-GPU] '{skinned.name}' meshName='{meshName}' cleanedName='{cleanedName}' verts={vertCount} tris={triCount} baseMeshHash=0x{baseMeshHash:X16} combinedMeshHash=0x{combinedMeshHash:X16} matId={matId} bones=[{boneNames}]");
                         }
                         
                         persistentSkinnedData[skinnedId] = new SkinnedMeshData
@@ -1712,6 +1735,7 @@ namespace UnityRemix
                 catch { }
                 
                 ulong combinedMeshHash = RemixMeshConverter.GenerateMeshHash(skinned.sharedMesh);
+                ulong baseMeshHash = combinedMeshHash;
                 if (skinned.bones != null)
                 {
                     foreach (var b in skinned.bones)
@@ -1720,6 +1744,20 @@ namespace UnityRemix
                             combinedMeshHash ^= HashUtils.HashStringFNV(b.name);
                         combinedMeshHash *= 1099511628211UL;
                     }
+                }
+                
+                // Debug: log hash components once per unique mesh name
+                string meshDebugKey = skinned.sharedMesh.name + "_bake";
+                if (!loggedHashDebugMeshes.Contains(meshDebugKey))
+                {
+                    loggedHashDebugMeshes.Add(meshDebugKey);
+                    string meshName = skinned.sharedMesh.name;
+                    string cleanedName = meshName.Replace(" (Instance)", "").Replace(" Instance", "").Replace("(Clone)", "").Trim();
+                    cleanedName = System.Text.RegularExpressions.Regex.Replace(cleanedName, @"[\s_-]*[0-9]+$", "");
+                    int vertCount = skinned.sharedMesh.vertexCount;
+                    int triCount = skinned.sharedMesh.triangles.Length;
+                    string boneNames = skinned.bones != null ? string.Join(",", System.Linq.Enumerable.Select(skinned.bones, b => b != null ? b.name : "null")) : "none";
+                    logger.LogInfo($"[HashDebug-BakeMesh] '{skinned.name}' meshName='{meshName}' cleanedName='{cleanedName}' verts={vertCount} tris={triCount} baseMeshHash=0x{baseMeshHash:X16} combinedMeshHash=0x{combinedMeshHash:X16} matId={matId} bones=[{boneNames}]");
                 }
                 
                 persistentSkinnedData[skinnedId] = new SkinnedMeshData

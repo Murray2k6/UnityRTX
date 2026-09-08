@@ -132,10 +132,15 @@ namespace UnityRemix
             return skinnedMeshHandles.TryGetValue(meshHash, out handle);
         }
         
+        public IntPtr CreateRemixMeshFromUnity(Mesh mesh, Material material)
+        {
+            return CreateRemixMeshFromUnity(mesh, material != null ? new Material[] { material } : null);
+        }
+
         /// <summary>
         /// Create and cache a Unity mesh in Remix format
         /// </summary>
-        public IntPtr CreateRemixMeshFromUnity(Mesh mesh, Material material)
+        public IntPtr CreateRemixMeshFromUnity(Mesh mesh, Material[] materials)
         {
             if (mesh == null || createMeshFunc == null)
                 return IntPtr.Zero;
@@ -157,9 +162,13 @@ namespace UnityRemix
             if (vertices == null || vertices.Length == 0)
                 return IntPtr.Zero;
             
-            // Extract triangles from all submeshes
-            var allTris = new List<int>();
-            for (int i = 0; i < mesh.subMeshCount; i++)
+            // Extract triangles per submesh
+            int subMeshCount = mesh.subMeshCount;
+            var submeshIndices = new List<uint[]>();
+            var submeshMaterials = new List<Material>();
+            var allTrianglesForNormals = new List<int>();
+
+            for (int i = 0; i < subMeshCount; i++)
             {
                 var topology = mesh.GetTopology(i);
                 if (topology != MeshTopology.Triangles)
@@ -170,38 +179,38 @@ namespace UnityRemix
                 }
                 
                 var subTris = mesh.GetTriangles(i);
-                if (subTris != null && subTris.Length > 0)
+                if (subTris == null || subTris.Length == 0 || subTris.Length % 3 != 0)
+                    continue;
+
+                bool valid = true;
+                uint[] sIdx = new uint[subTris.Length];
+                for (int j = 0; j < subTris.Length; j++)
                 {
-                    allTris.AddRange(subTris);
+                    if (subTris[j] < 0 || subTris[j] >= vertices.Length)
+                    {
+                        logger.LogError($"Mesh '{mesh.name}' submesh {i} has out-of-bounds index {subTris[j]}");
+                        valid = false;
+                        break;
+                    }
+                    sIdx[j] = (uint)subTris[j];
+                }
+
+                if (valid)
+                {
+                    submeshIndices.Add(sIdx);
+                    Material mat = (materials != null && i < materials.Length) ? materials[i] : null;
+                    submeshMaterials.Add(mat);
+                    allTrianglesForNormals.AddRange(subTris);
                 }
             }
-            
-            int[] triangles = allTris.ToArray();
-            
-            // Validate
-            if (triangles == null || triangles.Length == 0)
+
+            if (submeshIndices.Count == 0)
                 return IntPtr.Zero;
-            
-            if (triangles.Length % 3 != 0)
-            {
-                logger.LogError($"Mesh '{mesh.name}' has invalid triangle count: {triangles.Length}");
-                return IntPtr.Zero;
-            }
-            
-            // Validate indices
-            for (int i = 0; i < triangles.Length; i++)
-            {
-                if (triangles[i] < 0 || triangles[i] >= vertices.Length)
-                {
-                    logger.LogError($"Mesh '{mesh.name}' has out-of-bounds index {triangles[i]}");
-                    return IntPtr.Zero;
-                }
-            }
             
             // Ensure normals — compute from face geometry when unavailable
             if (normals == null || normals.Length != vertices.Length)
             {
-                normals = ComputeFaceNormals(vertices, triangles);
+                normals = ComputeFaceNormals(vertices, allTrianglesForNormals.ToArray());
                 logger.LogDebug($"Mesh '{mesh.name}': normals missing, computed from face geometry");
             }
             else
@@ -224,102 +233,150 @@ namespace UnityRemix
                 uvs = new Vector2[vertices.Length];
             }
             
-            // Convert to Remix vertices (Y-up to Z-up), applying _MainTex_ST tiling/offset
-            Vector4 st = new Vector4(1, 1, 0, 0);
-            if (material != null)
-                st = materialManager.GetMainTexST(material.GetInstanceID());
-            
             bool hasColors = colors != null && colors.Length == vertices.Length;
-            var remixVerts = new RemixAPI.remixapi_HardcodedVertex[vertices.Length];
-            for (int i = 0; i < vertices.Length; i++)
+
+            // Check if any surface needs UV tiling/offset applied
+            bool anyNonIdentityST = false;
+            for (int s = 0; s < submeshMaterials.Count; s++)
             {
-                float u = uvs[i].x * st.x + st.z;
-                float v = uvs[i].y * st.y + st.w;
-                uint col = hasColors ? Color32ToBGRA(colors[i]) : 0xFFFFFFFF;
-                remixVerts[i] = RemixAPI.MakeVertex(
-                    vertices[i].x, vertices[i].z, vertices[i].y,
-                    normals[i].x, normals[i].z, normals[i].y,
-                    u, v,
-                    col
-                );
+                if (submeshMaterials[s] != null)
+                {
+                    var st = materialManager.GetMainTexST(submeshMaterials[s].GetInstanceID());
+                    if (st.x != 1f || st.y != 1f || st.z != 0f || st.w != 0f)
+                    {
+                        anyNonIdentityST = true;
+                        break;
+                    }
+                }
             }
-            
-            // Convert indices
-            uint[] indices = new uint[triangles.Length];
-            for (int i = 0; i < triangles.Length; i++)
-                indices[i] = (uint)triangles[i];
-            
-            // Pin arrays
-            GCHandle vertexHandle = GCHandle.Alloc(remixVerts, GCHandleType.Pinned);
-            GCHandle indexHandle = GCHandle.Alloc(indices, GCHandleType.Pinned);
+
+            var vertexHandles = new List<GCHandle>();
+            var indexHandles = new List<GCHandle>();
+            var surfaceHandles = new List<GCHandle>();
             
             try
             {
-                // Get material handle
+                RemixAPI.remixapi_HardcodedVertex[] sharedRemixVerts = null;
+                GCHandle sharedVertexHandle = default;
+
+                if (!anyNonIdentityST)
+                {
+                    sharedRemixVerts = new RemixAPI.remixapi_HardcodedVertex[vertices.Length];
+                    for (int i = 0; i < vertices.Length; i++)
+                    {
+                        uint col = hasColors ? Color32ToBGRA(colors[i]) : 0xFFFFFFFF;
+                        sharedRemixVerts[i] = RemixAPI.MakeVertex(
+                            vertices[i].x, vertices[i].z, vertices[i].y,
+                            normals[i].x, normals[i].z, normals[i].y,
+                            uvs[i].x, uvs[i].y,
+                            col
+                        );
+                    }
+                    sharedVertexHandle = GCHandle.Alloc(sharedRemixVerts, GCHandleType.Pinned);
+                    vertexHandles.Add(sharedVertexHandle);
+                }
+
                 int meshId = mesh.GetInstanceID();
-                IntPtr materialHandle = IntPtr.Zero;
-                
-                if (material != null)
+                if (submeshMaterials.Count > 0 && submeshMaterials[0] != null)
                 {
-                    int matId = material.GetInstanceID();
-                    meshToMaterialMap[meshId] = matId;
-                    
-                    // Get or create material on-demand (called from render thread to avoid deadlocks)
-                    materialHandle = materialManager.GetOrCreateMaterial(matId);
+                    meshToMaterialMap[meshId] = submeshMaterials[0].GetInstanceID();
                 }
-                
-                var surface = new RemixAPI.remixapi_MeshInfoSurfaceTriangles
+
+                var surfaces = new RemixAPI.remixapi_MeshInfoSurfaceTriangles[submeshIndices.Count];
+                for (int s = 0; s < submeshIndices.Count; s++)
                 {
-                    vertices_values = vertexHandle.AddrOfPinnedObject(),
-                    vertices_count = (ulong)remixVerts.Length,
-                    indices_values = indexHandle.AddrOfPinnedObject(),
-                    indices_count = (ulong)indices.Length,
-                    skinning_hasvalue = 0,
-                    skinning_value = new RemixAPI.remixapi_MeshInfoSkinning(),
-                    material = materialHandle
-                };
-                
-                GCHandle surfaceHandle = GCHandle.Alloc(surface, GCHandleType.Pinned);
-                
-                try
-                {
-                    ulong meshHash = GenerateMeshHash(mesh);
-                    var meshInfo = new RemixAPI.remixapi_MeshInfo
+                    var surfIndices = submeshIndices[s];
+                    GCHandle idxHandle = GCHandle.Alloc(surfIndices, GCHandleType.Pinned);
+                    indexHandles.Add(idxHandle);
+
+                    Material mat = submeshMaterials[s];
+                    IntPtr materialHandle = IntPtr.Zero;
+                    if (mat != null)
                     {
-                        sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_MESH_INFO,
-                        pNext = IntPtr.Zero,
-                        hash = meshHash,
-                        surfaces_values = surfaceHandle.AddrOfPinnedObject(),
-                        surfaces_count = 1
+                        materialHandle = materialManager.GetOrCreateMaterial(mat.GetInstanceID());
+                    }
+
+                    IntPtr vertsPtr;
+                    ulong vertsCount;
+
+                    if (anyNonIdentityST)
+                    {
+                        Vector4 st = new Vector4(1, 1, 0, 0);
+                        if (mat != null)
+                            st = materialManager.GetMainTexST(mat.GetInstanceID());
+
+                        var surfVerts = new RemixAPI.remixapi_HardcodedVertex[vertices.Length];
+                        for (int i = 0; i < vertices.Length; i++)
+                        {
+                            float u = uvs[i].x * st.x + st.z;
+                            float v = uvs[i].y * st.y + st.w;
+                            uint col = hasColors ? Color32ToBGRA(colors[i]) : 0xFFFFFFFF;
+                            surfVerts[i] = RemixAPI.MakeVertex(
+                                vertices[i].x, vertices[i].z, vertices[i].y,
+                                normals[i].x, normals[i].z, normals[i].y,
+                                u, v,
+                                col
+                            );
+                        }
+                        var vHandle = GCHandle.Alloc(surfVerts, GCHandleType.Pinned);
+                        vertexHandles.Add(vHandle);
+                        vertsPtr = vHandle.AddrOfPinnedObject();
+                        vertsCount = (ulong)surfVerts.Length;
+                    }
+                    else
+                    {
+                        vertsPtr = sharedVertexHandle.AddrOfPinnedObject();
+                        vertsCount = (ulong)sharedRemixVerts.Length;
+                    }
+
+                    surfaces[s] = new RemixAPI.remixapi_MeshInfoSurfaceTriangles
+                    {
+                        vertices_values = vertsPtr,
+                        vertices_count = vertsCount,
+                        indices_values = idxHandle.AddrOfPinnedObject(),
+                        indices_count = (ulong)surfIndices.Length,
+                        skinning_hasvalue = 0,
+                        skinning_value = new RemixAPI.remixapi_MeshInfoSkinning(),
+                        material = materialHandle
                     };
-                    
-                    IntPtr handle;
-                    RemixAPI.remixapi_ErrorCode result;
-                    lock (apiLock)
-                    {
-                        result = createMeshFunc(ref meshInfo, out handle);
-                    }
-                    
-                    if (result != RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
-                    {
-                        logger.LogError($"Failed to create mesh '{mesh.name}': {result}");
-                        return IntPtr.Zero;
-                    }
-                    
-                    meshCache[meshId] = handle;
-                    logger.LogInfo($"Created mesh '{mesh.name}' with hash: 0x{meshHash:X16}");
-                    
-                    return handle;
                 }
-                finally
+
+                GCHandle surfaceArrayHandle = GCHandle.Alloc(surfaces, GCHandleType.Pinned);
+                surfaceHandles.Add(surfaceArrayHandle);
+
+                ulong meshHash = GenerateMeshHash(mesh);
+                var meshInfo = new RemixAPI.remixapi_MeshInfo
                 {
-                    surfaceHandle.Free();
+                    sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_MESH_INFO,
+                    pNext = IntPtr.Zero,
+                    hash = meshHash,
+                    surfaces_values = surfaceArrayHandle.AddrOfPinnedObject(),
+                    surfaces_count = (uint)surfaces.Length
+                };
+
+                IntPtr handle;
+                RemixAPI.remixapi_ErrorCode result;
+                lock (apiLock)
+                {
+                    result = createMeshFunc(ref meshInfo, out handle);
                 }
+
+                if (result != RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
+                {
+                    logger.LogError($"Failed to create mesh '{mesh.name}': {result}");
+                    return IntPtr.Zero;
+                }
+
+                meshCache[meshId] = handle;
+                logger.LogInfo($"Created mesh '{mesh.name}' with hash: 0x{meshHash:X16} and {surfaces.Length} surfaces");
+
+                return handle;
             }
             finally
             {
-                vertexHandle.Free();
-                indexHandle.Free();
+                foreach (var h in vertexHandles) h.Free();
+                foreach (var h in indexHandles) h.Free();
+                foreach (var h in surfaceHandles) h.Free();
             }
         }
         
