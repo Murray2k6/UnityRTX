@@ -9,6 +9,24 @@ using UnityEngine;
 namespace UnityRemix
 {
     /// <summary>
+    /// Holds pre-extracted mesh geometry and materials gathered on the main thread
+    /// so Remix meshes can be created safely on the background render thread
+    /// without touching UnityEngine.Mesh APIs.
+    /// </summary>
+    public class PreparedMeshData
+    {
+        public int MeshId;
+        public string MeshName;
+        public ulong MeshHash;
+        public Vector3[] Vertices;
+        public Vector3[] Normals;
+        public Vector2[] UVs;
+        public Color32[] Colors;
+        public List<uint[]> SubmeshIndices;
+        public List<Material> SubmeshMaterials;
+    }
+
+    /// <summary>
     /// Converts Unity meshes (static and skinned) to Remix format
     /// </summary>
     public class RemixMeshConverter
@@ -140,99 +158,130 @@ namespace UnityRemix
         /// <summary>
         /// Create and cache a Unity mesh in Remix format
         /// </summary>
+        /// <summary>
+        /// Create and cache a Unity mesh in Remix format
+        /// </summary>
         public IntPtr CreateRemixMeshFromUnity(Mesh mesh, Material[] materials)
         {
             if (mesh == null || createMeshFunc == null)
                 return IntPtr.Zero;
-            
-            Vector3[] vertices;
-            try
-            {
-                vertices = mesh.vertices;
-            }
-            catch
-            {
-                // Non-readable mesh (e.g. static-batched combined mesh on Unity 2019)
-                return IntPtr.Zero;
-            }
-            Vector3[] normals = mesh.normals;
-            Vector2[] uvs = mesh.uv;
-            Color32[] colors = mesh.colors32;
-            
-            if (vertices == null || vertices.Length == 0)
-                return IntPtr.Zero;
-            
-            // Extract triangles per submesh
-            int subMeshCount = mesh.subMeshCount;
+
+            Vector3[] vertices = null;
+            Vector3[] normals = null;
+            Vector2[] uvs = null;
+            Color32[] colors = null;
             var submeshIndices = new List<uint[]>();
             var submeshMaterials = new List<Material>();
-            var allTrianglesForNormals = new List<int>();
 
-            for (int i = 0; i < subMeshCount; i++)
+            if (mesh.isReadable)
             {
-                var topology = mesh.GetTopology(i);
-                if (topology != MeshTopology.Triangles)
+                try
                 {
-                    if (configDebugLogInterval.Value > 0)
-                        logger.LogWarning($"Skipping submesh {i} of '{mesh.name}' with topology: {topology}");
-                    continue;
-                }
-                
-                var subTris = mesh.GetTriangles(i);
-                if (subTris == null || subTris.Length == 0 || subTris.Length % 3 != 0)
-                    continue;
+                    vertices = mesh.vertices;
+                    normals = mesh.normals;
+                    uvs = mesh.uv;
+                    colors = mesh.colors32;
+                    if (colors != null && colors.Length == 0) colors = null;
 
-                bool valid = true;
-                uint[] sIdx = new uint[subTris.Length];
-                for (int j = 0; j < subTris.Length; j++)
-                {
-                    if (subTris[j] < 0 || subTris[j] >= vertices.Length)
+                    int subMeshCount = mesh.subMeshCount;
+                    for (int i = 0; i < subMeshCount; i++)
                     {
-                        logger.LogError($"Mesh '{mesh.name}' submesh {i} has out-of-bounds index {subTris[j]}");
-                        valid = false;
-                        break;
+                        if (mesh.GetTopology(i) != MeshTopology.Triangles) continue;
+                        var subTris = mesh.GetTriangles(i);
+                        if (subTris == null || subTris.Length == 0 || subTris.Length % 3 != 0) continue;
+                        uint[] sIdx = new uint[subTris.Length];
+                        for (int j = 0; j < subTris.Length; j++) sIdx[j] = (uint)subTris[j];
+                        submeshIndices.Add(sIdx);
+                        Material mat = (materials != null && i < materials.Length) ? materials[i] : null;
+                        submeshMaterials.Add(mat);
                     }
-                    sIdx[j] = (uint)subTris[j];
                 }
-
-                if (valid)
-                {
-                    submeshIndices.Add(sIdx);
-                    Material mat = (materials != null && i < materials.Length) ? materials[i] : null;
-                    submeshMaterials.Add(mat);
-                    allTrianglesForNormals.AddRange(subTris);
-                }
+                catch { }
             }
 
-            if (submeshIndices.Count == 0)
+            if (vertices == null || vertices.Length == 0 || submeshIndices.Count == 0)
+            {
+                try
+                {
+                    if (NativeMeshReader.ReadMeshFromGPU(mesh, out vertices, out normals, out uvs, out int[][] subTris))
+                    {
+                        submeshIndices.Clear();
+                        submeshMaterials.Clear();
+                        for (int i = 0; i < subTris.Length; i++)
+                        {
+                            var tris = subTris[i];
+                            if (tris == null || tris.Length == 0 || tris.Length % 3 != 0) continue;
+                            uint[] sIdx = new uint[tris.Length];
+                            for (int j = 0; j < tris.Length; j++) sIdx[j] = (uint)tris[j];
+                            submeshIndices.Add(sIdx);
+                            Material mat = (materials != null && i < materials.Length) ? materials[i] : null;
+                            submeshMaterials.Add(mat);
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            if (vertices == null || vertices.Length == 0 || submeshIndices.Count == 0)
                 return IntPtr.Zero;
-            
+
+            int totalIndices = 0;
+            foreach (var sIdx in submeshIndices) totalIndices += sIdx.Length;
+            ulong meshHash = GenerateMeshHash(mesh.name, vertices.Length, totalIndices);
+
+            var prepared = new PreparedMeshData
+            {
+                MeshId = mesh.GetInstanceID(),
+                MeshName = mesh.name,
+                MeshHash = meshHash,
+                Vertices = vertices,
+                Normals = normals,
+                UVs = uvs,
+                Colors = colors,
+                SubmeshIndices = submeshIndices,
+                SubmeshMaterials = submeshMaterials
+            };
+
+            return CreateRemixMeshFromPrepared(prepared);
+        }
+
+        /// <summary>
+        /// Create and cache a Remix mesh from pre-extracted geometry data (safe to call on background render thread).
+        /// </summary>
+        public IntPtr CreateRemixMeshFromPrepared(PreparedMeshData data)
+        {
+            if (data == null || createMeshFunc == null)
+                return IntPtr.Zero;
+
+            Vector3[] vertices = data.Vertices;
+            Vector3[] normals = data.Normals;
+            Vector2[] uvs = data.UVs;
+            Color32[] colors = data.Colors;
+            var submeshIndices = data.SubmeshIndices;
+            var submeshMaterials = data.SubmeshMaterials;
+
+            if (vertices == null || vertices.Length == 0 || submeshIndices == null || submeshIndices.Count == 0)
+                return IntPtr.Zero;
+
             // Ensure normals — compute from face geometry when unavailable
             if (normals == null || normals.Length != vertices.Length)
             {
-                normals = ComputeFaceNormals(vertices, allTrianglesForNormals.ToArray());
-                logger.LogDebug($"Mesh '{mesh.name}': normals missing, computed from face geometry");
-            }
-            else
-            {
-                // Diagnostic: log a sample of vertex normals to detect zero/degenerate data
-                int zeroCount = 0;
-                Vector3 sample = Vector3.zero;
-                for (int i = 0; i < normals.Length; i++)
+                var allTris = new List<int>();
+                foreach (var idx in submeshIndices)
                 {
-                    if (normals[i].sqrMagnitude < 1e-6f) zeroCount++;
-                    else if (sample == Vector3.zero) sample = normals[i];
+                    if (idx == null) continue;
+                    for (int j = 0; j < idx.Length; j++)
+                        allTris.Add((int)idx[j]);
                 }
-                if (zeroCount > 0)
-                    logger.LogWarning($"Mesh '{mesh.name}': {zeroCount}/{normals.Length} normals are zero-length, sample=({sample.x:F3},{sample.y:F3},{sample.z:F3})");
+                normals = ComputeFaceNormals(vertices, allTris.ToArray());
             }
-            
+
             // Ensure UVs
             if (uvs == null || uvs.Length != vertices.Length)
             {
                 uvs = new Vector2[vertices.Length];
             }
-            
+
             bool hasColors = colors != null && colors.Length == vertices.Length;
 
             // Check if any surface needs UV tiling/offset applied
@@ -253,7 +302,7 @@ namespace UnityRemix
             var vertexHandles = new List<GCHandle>();
             var indexHandles = new List<GCHandle>();
             var surfaceHandles = new List<GCHandle>();
-            
+
             try
             {
                 RemixAPI.remixapi_HardcodedVertex[] sharedRemixVerts = null;
@@ -276,7 +325,7 @@ namespace UnityRemix
                     vertexHandles.Add(sharedVertexHandle);
                 }
 
-                int meshId = mesh.GetInstanceID();
+                int meshId = data.MeshId;
                 if (submeshMaterials.Count > 0 && submeshMaterials[0] != null)
                 {
                     meshToMaterialMap[meshId] = submeshMaterials[0].GetInstanceID();
@@ -289,7 +338,7 @@ namespace UnityRemix
                     GCHandle idxHandle = GCHandle.Alloc(surfIndices, GCHandleType.Pinned);
                     indexHandles.Add(idxHandle);
 
-                    Material mat = submeshMaterials[s];
+                    Material mat = (s < submeshMaterials.Count) ? submeshMaterials[s] : null;
                     IntPtr materialHandle = IntPtr.Zero;
                     if (mat != null)
                     {
@@ -344,7 +393,7 @@ namespace UnityRemix
                 GCHandle surfaceArrayHandle = GCHandle.Alloc(surfaces, GCHandleType.Pinned);
                 surfaceHandles.Add(surfaceArrayHandle);
 
-                ulong meshHash = GenerateMeshHash(mesh);
+                ulong meshHash = data.MeshHash;
                 var meshInfo = new RemixAPI.remixapi_MeshInfo
                 {
                     sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_MESH_INFO,
@@ -363,12 +412,12 @@ namespace UnityRemix
 
                 if (result != RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
                 {
-                    logger.LogError($"Failed to create mesh '{mesh.name}': {result}");
+                    logger.LogError($"Failed to create mesh '{data.MeshName}': {result}");
                     return IntPtr.Zero;
                 }
 
                 meshCache[meshId] = handle;
-                logger.LogInfo($"Created mesh '{mesh.name}' with hash: 0x{meshHash:X16} and {surfaces.Length} surfaces");
+                logger.LogInfo($"Created mesh '{data.MeshName}' with hash: 0x{meshHash:X16} and {surfaces.Length} surfaces");
 
                 return handle;
             }
@@ -871,11 +920,11 @@ namespace UnityRemix
         /// <summary>
         /// Generate stable content-based hash for mesh
         /// </summary>
-        public static ulong GenerateMeshHash(Mesh mesh)
+        public static ulong GenerateMeshHash(string meshName, int vertexCount, int indexCount)
         {
             ulong hash = 14695981039346656037UL; // FNV offset basis
             
-            string cleanName = mesh.name;
+            string cleanName = meshName;
             if (!string.IsNullOrEmpty(cleanName))
             {
                 // Remove dynamic tags
@@ -887,14 +936,42 @@ namespace UnityRemix
                 }
             }
             
-            // Hash vertex count and triangle count
-            hash ^= (ulong)mesh.vertexCount;
+            // Hash vertex count and triangle/index count
+            hash ^= (ulong)vertexCount;
             hash *= 1099511628211UL;
-            hash ^= (ulong)mesh.triangles.Length;
+            hash ^= (ulong)indexCount;
             hash *= 1099511628211UL;
             
             if (hash == 0) hash = 1;
             return hash;
+        }
+
+        public static ulong GenerateMeshHash(Mesh mesh)
+        {
+            if (mesh == null) return 1;
+            int indexCount = 0;
+            try
+            {
+                if (mesh.isReadable)
+                {
+                    indexCount = mesh.triangles.Length;
+                }
+                else
+                {
+                    for (int s = 0; s < mesh.subMeshCount; s++)
+                        indexCount += (int)mesh.GetIndexCount(s);
+                }
+            }
+            catch
+            {
+                try
+                {
+                    for (int s = 0; s < mesh.subMeshCount; s++)
+                        indexCount += (int)mesh.GetIndexCount(s);
+                }
+                catch { }
+            }
+            return GenerateMeshHash(mesh.name, mesh.vertexCount, indexCount);
         }
         
         /// <summary>

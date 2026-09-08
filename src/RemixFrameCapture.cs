@@ -163,13 +163,8 @@ namespace UnityRemix
             }
         }
         
-        // Mesh creation queue with materials
-        private struct MeshToCreate
-        {
-            public Mesh mesh;
-            public Material[] materials;
-        }
-        private Queue<MeshToCreate> meshesToCreate = new Queue<MeshToCreate>();
+        // Mesh creation queue with pre-extracted geometry data
+        private Queue<PreparedMeshData> meshesToCreate = new Queue<PreparedMeshData>();
         private HashSet<int> meshesInQueue = new HashSet<int>(); // Track which meshes are already queued
         private HashSet<int> failedMeshIds = new HashSet<int>(); // Meshes that failed creation (non-readable)
         private readonly object meshQueueLock = new object(); // Synchronize main thread enqueue + render thread dequeue
@@ -816,8 +811,109 @@ namespace UnityRemix
                 
                 if (needsQueue)
                 {
-                    // Capture material textures (pixel data gathered here, Remix API deferred to render thread)
+                    Vector3[] vertices = null;
+                    Vector3[] normals = null;
+                    Vector2[] uvs = null;
+                    Color32[] colors = null;
+                    var submeshIndices = new List<uint[]>();
+                    var submeshMaterials = new List<Material>();
                     var materials = renderer.sharedMaterials;
+
+                    if (mesh.isReadable)
+                    {
+                        try
+                        {
+                            vertices = mesh.vertices;
+                            normals = mesh.normals;
+                            uvs = mesh.uv;
+                            colors = mesh.colors32;
+                            if (colors != null && colors.Length == 0) colors = null;
+
+                            int subMeshCount = mesh.subMeshCount;
+                            for (int s = 0; s < subMeshCount; s++)
+                            {
+                                if (mesh.GetTopology(s) != MeshTopology.Triangles)
+                                    continue;
+                                var subTris = mesh.GetTriangles(s);
+                                if (subTris == null || subTris.Length == 0 || subTris.Length % 3 != 0)
+                                    continue;
+                                bool valid = true;
+                                uint[] sIdx = new uint[subTris.Length];
+                                for (int j = 0; j < subTris.Length; j++)
+                                {
+                                    if (subTris[j] < 0 || subTris[j] >= vertices.Length)
+                                    {
+                                        valid = false;
+                                        break;
+                                    }
+                                    sIdx[j] = (uint)subTris[j];
+                                }
+                                if (valid)
+                                {
+                                    submeshIndices.Add(sIdx);
+                                    Material mat = (materials != null && s < materials.Length) ? materials[s] : null;
+                                    submeshMaterials.Add(mat);
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            if (configDebugLogInterval.Value > 0)
+                                logger.LogWarning($"Failed reading readable mesh '{mesh.name}': {ex.Message}");
+                        }
+                    }
+
+                    if (vertices == null || vertices.Length == 0 || submeshIndices.Count == 0)
+                    {
+                        try
+                        {
+                            if (NativeMeshReader.ReadMeshFromGPU(mesh, out vertices, out normals, out uvs, out int[][] subTris))
+                            {
+                                submeshIndices.Clear();
+                                submeshMaterials.Clear();
+                                for (int s = 0; s < subTris.Length; s++)
+                                {
+                                    var tris = subTris[s];
+                                    if (tris == null || tris.Length == 0 || tris.Length % 3 != 0)
+                                        continue;
+                                    bool valid = true;
+                                    uint[] sIdx = new uint[tris.Length];
+                                    for (int j = 0; j < tris.Length; j++)
+                                    {
+                                        if (tris[j] < 0 || tris[j] >= vertices.Length)
+                                        {
+                                            valid = false;
+                                            break;
+                                        }
+                                        sIdx[j] = (uint)tris[j];
+                                    }
+                                    if (valid)
+                                    {
+                                        submeshIndices.Add(sIdx);
+                                        Material mat = (materials != null && s < materials.Length) ? materials[s] : null;
+                                        submeshMaterials.Add(mat);
+                                    }
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            if (configDebugLogInterval.Value > 0)
+                                logger.LogWarning($"GPU readback failed for mesh '{mesh.name}': {ex.Message}");
+                        }
+                    }
+
+                    if (vertices == null || vertices.Length == 0 || submeshIndices.Count == 0)
+                    {
+                        lock (meshQueueLock) { failedMeshIds.Add(meshId); }
+                        continue;
+                    }
+
+                    int totalIndices = 0;
+                    foreach (var sIdx in submeshIndices) totalIndices += sIdx.Length;
+                    ulong meshHash = RemixMeshConverter.GenerateMeshHash(mesh.name, vertices.Length, totalIndices);
+
+                    // Capture material textures (pixel data gathered here, Remix API deferred to render thread)
                     if (materials != null)
                     {
                         for (int m = 0; m < materials.Length; m++)
@@ -830,13 +926,20 @@ namespace UnityRemix
                         }
                     }
                     
-                    // Queue mesh with its materials
+                    // Queue pre-extracted mesh data
                     lock (meshQueueLock)
                     {
-                        meshesToCreate.Enqueue(new MeshToCreate
+                        meshesToCreate.Enqueue(new PreparedMeshData
                         {
-                            mesh = mesh,
-                            materials = materials
+                            MeshId = meshId,
+                            MeshName = mesh.name,
+                            MeshHash = meshHash,
+                            Vertices = vertices,
+                            Normals = normals,
+                            UVs = uvs,
+                            Colors = colors,
+                            SubmeshIndices = submeshIndices,
+                            SubmeshMaterials = submeshMaterials
                         });
                         meshesInQueue.Add(meshId);
                     }
@@ -958,15 +1061,15 @@ namespace UnityRemix
             
             for (int i = 0; i < batchSize; i++)
             {
-                MeshToCreate meshData;
+                PreparedMeshData meshData;
                 lock (meshQueueLock)
                 {
                     if (meshesToCreate.Count == 0) break;
                     meshData = meshesToCreate.Dequeue();
                 }
-                if (meshData.mesh == null) continue;
+                if (meshData == null) continue;
                 
-                int meshId = meshData.mesh.GetInstanceID();
+                int meshId = meshData.MeshId;
                 
                 // Remove from queue tracking
                 lock (meshQueueLock)
@@ -979,13 +1082,13 @@ namespace UnityRemix
                 
                 try
                 {
-                    // Create mesh with its materials!
-                    IntPtr handle = meshConverter.CreateRemixMeshFromUnity(meshData.mesh, meshData.materials);
+                    // Create mesh with its pre-extracted data!
+                    IntPtr handle = meshConverter.CreateRemixMeshFromPrepared(meshData);
                     
                     if (handle == IntPtr.Zero)
                     {
                         if (configDebugLogInterval.Value > 0)
-                            logger.LogWarning($"[MeshFail] Failed to create mesh '{meshData.mesh.name}' readable={meshData.mesh.isReadable} vertCount={meshData.mesh.vertexCount} subMeshCount={meshData.mesh.subMeshCount}");
+                            logger.LogWarning($"[MeshFail] Failed to create mesh '{meshData.MeshName}' vertCount={meshData.Vertices?.Length} subMeshCount={meshData.SubmeshIndices?.Count}");
                         lock (meshQueueLock) { failedMeshIds.Add(meshId); }
                     }
                     

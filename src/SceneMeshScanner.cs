@@ -893,90 +893,14 @@ namespace UnityRemix
             colors = newCols;
         }
 
-        /// <summary>
-        /// Reads vertex data from GPU buffers for meshes where CPU data is unavailable.
-        /// Uses Mesh.GetVertexBuffer/GetIndexBuffer which bypass the isReadable check.
-        /// </summary>
         private bool ReadMeshFromGPU(Mesh mesh, out Vector3[] positions, out Vector3[] normals, out Vector2[] uvs, out int[][] subMeshIndices)
         {
-            positions = null;
-            normals = null;
-            uvs = null;
-            subMeshIndices = null;
-
-            int vertexCount = mesh.vertexCount;
-            if (vertexCount == 0)
-                return false;
-
-            // Get vertex layout
-            var attributes = mesh.GetVertexAttributes();
-            int stride = MeshCompat.GetVertexBufferStride(mesh, 0);
-
-            int posOffset = -1, posStream = -1;
-            int normOffset = -1, normStream = -1;
-            int uvOffset = -1, uvStream = -1;
-            VertexAttributeFormat posFormat = VertexAttributeFormat.Float32;
-            VertexAttributeFormat normFormat = VertexAttributeFormat.Float32;
-            VertexAttributeFormat uvFormat = VertexAttributeFormat.Float32;
-
-            foreach (var attr in attributes)
-            {
-                switch (attr.attribute)
-                {
-                    case VertexAttribute.Position:
-                        posOffset = MeshCompat.GetVertexAttributeOffset(mesh, VertexAttribute.Position);
-                        posStream = attr.stream;
-                        posFormat = attr.format;
-                        break;
-                    case VertexAttribute.Normal:
-                        normOffset = MeshCompat.GetVertexAttributeOffset(mesh, VertexAttribute.Normal);
-                        normStream = attr.stream;
-                        normFormat = attr.format;
-                        break;
-                    case VertexAttribute.TexCoord0:
-                        uvOffset = MeshCompat.GetVertexAttributeOffset(mesh, VertexAttribute.TexCoord0);
-                        uvStream = attr.stream;
-                        uvFormat = attr.format;
-                        break;
-                }
-            }
-
-            if (posOffset < 0 || posStream != 0)
-                return false;
-
-            // Use native D3D11 readback — works for non-readable meshes in Unity 2019
-            return NativeMeshReader.ReadMesh(mesh, stride,
-                posOffset, posFormat,
-                normOffset >= 0 && normStream == 0 ? normOffset : -1, normFormat,
-                uvOffset >= 0 && uvStream == 0 ? uvOffset : -1, uvFormat,
-                out positions, out normals, out uvs, out subMeshIndices);
+            return NativeMeshReader.ReadMeshFromGPU(mesh, out positions, out normals, out uvs, out subMeshIndices);
         }
 
-        /// <summary>
-        /// Compute per-vertex normals by averaging face normals of adjacent triangles.
-        /// </summary>
         private static Vector3[] ComputeFaceNormals(Vector3[] verts, int[][] subMeshIndices)
         {
-            var normals = new Vector3[verts.Length];
-            foreach (var indices in subMeshIndices)
-            {
-                if (indices == null) continue;
-                for (int i = 0; i + 2 < indices.Length; i += 3)
-                {
-                    int i0 = indices[i], i1 = indices[i + 1], i2 = indices[i + 2];
-                    if (i0 >= verts.Length || i1 >= verts.Length || i2 >= verts.Length) continue;
-                    var faceNormal = Vector3.Cross(verts[i1] - verts[i0], verts[i2] - verts[i0]);
-                    normals[i0] += faceNormal;
-                    normals[i1] += faceNormal;
-                    normals[i2] += faceNormal;
-                }
-            }
-            for (int i = 0; i < normals.Length; i++)
-            {
-                float len = normals[i].magnitude;
-                normals[i] = len > 1e-6f ? normals[i] / len : Vector3.up;
-            }
-            return normals;
+            return NativeMeshReader.ComputeFaceNormals(verts, subMeshIndices);
         }
     }
 }
