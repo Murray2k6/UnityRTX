@@ -1285,9 +1285,11 @@ namespace UnityRemix
                 var skinned = cachedSkinnedRenderers[i];
                 if (skinned == null || !skinned.enabled || !skinned.gameObject.activeInHierarchy)
                 {
-                    // Log if this was a previously tracked mesh (helps debug disappearing geometry)
-                    if (configDebugLogInterval.Value > 0 && skinned != null && persistentSkinnedData.ContainsKey(HashUtils.GetHierarchyHashInt(skinned.transform)))
-                        logger.LogWarning($"[SkinSkip] '{skinned.gameObject.name}' id={HashUtils.GetHierarchyHashInt(skinned.transform)}: enabled={skinned.enabled}, activeInHierarchy={skinned.gameObject.activeInHierarchy}, activeSelf={skinned.gameObject.activeSelf}");
+                    if (skinned != null)
+                    {
+                        int staleId = HashUtils.GetHierarchyHashInt(skinned.transform);
+                        persistentSkinnedData.Remove(staleId);
+                    }
                     skipNull++;
                     continue;
                 }
@@ -1444,52 +1446,35 @@ namespace UnityRemix
                 }
             }
             
-            // Prune stale persistent entries
-            if (frameCount % 120 == 0)
+            // Prune any persistent entries that are no longer valid (e.g. unequipped weapons, deactivated objects)
+            if (persistentSkinnedData.Count > validSkinnedIds.Count)
             {
-                var staleIds = new List<int>();
+                var staleIds = (List<int>)null;
                 foreach (var id in persistentSkinnedData.Keys)
-                    if (!validSkinnedIds.Contains(id))
-                        staleIds.Add(id);
-                foreach (var id in staleIds)
                 {
-                    if (configDebugLogInterval.Value > 0)
+                    if (!validSkinnedIds.Contains(id))
                     {
-                        string reason = "unknown";
-                        bool foundInCache = false;
-                        for (int di = 0; di < cachedSkinnedRenderers.Count; di++)
-                        {
-                            var sr = cachedSkinnedRenderers[di];
-                            if (sr == null) continue;
-                            if (sr.GetInstanceID() == id)
-                            {
-                                foundInCache = true;
-                                if (!sr.enabled)
-                                    reason = "renderer DISABLED";
-                                else if (!sr.gameObject.activeInHierarchy)
-                                    reason = $"GameObject INACTIVE (name={sr.gameObject.name})";
-                                else if (IsLayerDisabled(sr.gameObject.layer))
-                                    reason = $"layer {sr.gameObject.layer} disabled";
-                                else if (sr.sharedMesh == null)
-                                    reason = "sharedMesh is NULL";
-                                else
-                                    reason = $"passed filters but not in validSet (enabled={sr.enabled}, active={sr.gameObject.activeInHierarchy}, mesh={sr.sharedMesh?.name})";
-                                break;
-                            }
-                        }
-                        if (!foundInCache)
-                            reason = "NOT in cachedSkinnedRenderers (destroyed or replaced with MeshRenderer?)";
-                        
-                        var pruned = persistentSkinnedData[id];
-                        logger.LogWarning($"[SkinPrune] Removing skinned mesh id={id} (verts={pruned.vertices?.Length}, tris={pruned.triangles?.Length/3}): {reason}");
+                        if (staleIds == null) staleIds = new List<int>();
+                        staleIds.Add(id);
                     }
-                    persistentSkinnedData.Remove(id);
+                }
+                if (staleIds != null)
+                {
+                    for (int s = 0; s < staleIds.Count; s++)
+                    {
+                        persistentSkinnedData.Remove(staleIds[s]);
+                    }
                 }
             }
             
-            // Step 5: Submit ALL persistent entries to frame state
+            // Step 5: Submit only currently valid entries to frame state
             foreach (var entry in persistentSkinnedData.Values)
-                state.skinned.Add(entry);
+            {
+                if (validSkinnedIds.Contains(entry.meshId))
+                {
+                    state.skinned.Add(entry);
+                }
+            }
             
             if (doLog && total > 0)
             {
