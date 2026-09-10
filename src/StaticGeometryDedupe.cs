@@ -130,7 +130,7 @@ namespace UnityRemix
                 Quantize(bounds.extents.z));
         }
 
-        private static int ComputeMaterialSignature(Material[] materials)
+        public static int ComputeMaterialSignature(Material[] materials)
         {
             unchecked
             {

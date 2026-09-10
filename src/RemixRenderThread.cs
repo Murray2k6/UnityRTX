@@ -302,7 +302,8 @@ namespace UnityRemix
             
             foreach (var instance in state.instances)
             {
-                if (meshConverter.TryGetMeshHandle(instance.meshId, out IntPtr meshHandle))
+                ulong meshKey = instance.meshKey != 0 ? instance.meshKey : (ulong)(uint)instance.meshId;
+                if (meshConverter.TryGetMeshHandle(meshKey, out IntPtr meshHandle))
                 {
                     if (!StaticGeometryDedupe.TryClaimVisibleInstance(instance.rendererInstanceId, instance.dedupeKey, claimedRendererIds, claimedStaticKeys))
                         continue;

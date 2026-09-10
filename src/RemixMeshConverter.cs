@@ -15,6 +15,7 @@ namespace UnityRemix
     /// </summary>
     public class PreparedMeshData
     {
+        public ulong MeshKey;
         public int MeshId;
         public string MeshName;
         public ulong MeshHash;
@@ -72,8 +73,8 @@ namespace UnityRemix
         private RemixAPI.PFN_remixapi_DestroyMesh destroyMeshFunc;
         private RemixAPI.PFN_remixapi_DrawInstance drawInstanceFunc;
         
-        // Cache for game meshes - maps Unity mesh instance ID to Remix handle
-        private ConcurrentDictionary<int, IntPtr> meshCache = new ConcurrentDictionary<int, IntPtr>();
+        // Cache for game meshes - maps composite mesh key (meshId + materialSignature) to Remix handle
+        private ConcurrentDictionary<ulong, IntPtr> meshCache = new ConcurrentDictionary<ulong, IntPtr>();
         
         // Cache for skinned mesh Remix handles - keyed by Remix mesh hash
         private Dictionary<ulong, IntPtr> skinnedMeshHandles = new Dictionary<ulong, IntPtr>();
@@ -82,8 +83,8 @@ namespace UnityRemix
         private Queue<IntPtr> deferredDestroyQueue = new Queue<IntPtr>();
         private const int DEFERRED_DESTROY_FRAMES = 3; // Keep handles alive for 3 frames
         
-        // Track which material each mesh uses (mesh ID -> material ID)
-        private Dictionary<int, int> meshToMaterialMap = new Dictionary<int, int>();
+        // Track which material each mesh uses (composite mesh key -> material ID)
+        private Dictionary<ulong, int> meshToMaterialMap = new Dictionary<ulong, int>();
         
         // GCHandle pooling for skinned meshes to reduce allocations
         private struct PinnedMeshData
@@ -127,19 +128,37 @@ namespace UnityRemix
         }
         
         /// <summary>
+        /// Compute 64-bit composite mesh key from mesh instance ID and material signature
+        /// </summary>
+        public static ulong GetMeshKey(int meshId, int materialSignature)
+        {
+            return ((ulong)(uint)meshId << 32) | (uint)materialSignature;
+        }
+
+        /// <summary>
         /// Check if mesh is already cached
         /// </summary>
+        public bool IsMeshCached(ulong meshKey)
+        {
+            return meshCache.ContainsKey(meshKey);
+        }
+
         public bool IsMeshCached(int meshId)
         {
-            return meshCache.ContainsKey(meshId);
+            return meshCache.ContainsKey((ulong)(uint)meshId);
         }
         
         /// <summary>
         /// Get cached mesh handle
         /// </summary>
+        public bool TryGetMeshHandle(ulong meshKey, out IntPtr handle)
+        {
+            return meshCache.TryGetValue(meshKey, out handle);
+        }
+
         public bool TryGetMeshHandle(int meshId, out IntPtr handle)
         {
-            return meshCache.TryGetValue(meshId, out handle);
+            return meshCache.TryGetValue((ulong)(uint)meshId, out handle);
         }
         
         /// <summary>
@@ -227,10 +246,13 @@ namespace UnityRemix
 
             int totalIndices = 0;
             foreach (var sIdx in submeshIndices) totalIndices += sIdx.Length;
-            ulong meshHash = GenerateMeshHash(mesh.name, vertices.Length, totalIndices);
+            int matSig = StaticGeometryDedupe.ComputeMaterialSignature(materials);
+            ulong meshHash = GenerateMeshHash(mesh.name, vertices.Length, totalIndices, matSig);
+            ulong meshKey = GetMeshKey(mesh.GetInstanceID(), matSig);
 
             var prepared = new PreparedMeshData
             {
+                MeshKey = meshKey,
                 MeshId = mesh.GetInstanceID(),
                 MeshName = mesh.name,
                 MeshHash = meshHash,
@@ -325,10 +347,10 @@ namespace UnityRemix
                     vertexHandles.Add(sharedVertexHandle);
                 }
 
-                int meshId = data.MeshId;
+                ulong meshKey = data.MeshKey != 0 ? data.MeshKey : (ulong)(uint)data.MeshId;
                 if (submeshMaterials.Count > 0 && submeshMaterials[0] != null)
                 {
-                    meshToMaterialMap[meshId] = submeshMaterials[0].GetInstanceID();
+                    meshToMaterialMap[meshKey] = submeshMaterials[0].GetInstanceID();
                 }
 
                 var surfaces = new RemixAPI.remixapi_MeshInfoSurfaceTriangles[submeshIndices.Count];
@@ -416,7 +438,7 @@ namespace UnityRemix
                     return IntPtr.Zero;
                 }
 
-                meshCache[meshId] = handle;
+                meshCache[meshKey] = handle;
                 logger.LogInfo($"Created mesh '{data.MeshName}' with hash: 0x{meshHash:X16} and {surfaces.Length} surfaces");
 
                 return handle;
@@ -920,7 +942,7 @@ namespace UnityRemix
         /// <summary>
         /// Generate stable content-based hash for mesh
         /// </summary>
-        public static ulong GenerateMeshHash(string meshName, int vertexCount, int indexCount)
+        public static ulong GenerateMeshHash(string meshName, int vertexCount, int indexCount, int materialSignature = 0)
         {
             ulong hash = 14695981039346656037UL; // FNV offset basis
             
@@ -942,6 +964,12 @@ namespace UnityRemix
             hash ^= (ulong)indexCount;
             hash *= 1099511628211UL;
             
+            if (materialSignature != 0)
+            {
+                hash ^= (ulong)(uint)materialSignature;
+                hash *= 1099511628211UL;
+            }
+
             if (hash == 0) hash = 1;
             return hash;
         }
@@ -1054,9 +1082,14 @@ namespace UnityRemix
         public int MeshCacheCount => meshCache.Count;
         public int SkinnedMeshHandleCount => skinnedMeshHandles.Count;
 
+        public bool TryGetMaterialId(ulong meshKey, out int materialId)
+        {
+            return meshToMaterialMap.TryGetValue(meshKey, out materialId);
+        }
+
         public bool TryGetMaterialId(int meshId, out int materialId)
         {
-            return meshToMaterialMap.TryGetValue(meshId, out materialId);
+            return meshToMaterialMap.TryGetValue((ulong)(uint)meshId, out materialId);
         }
         
         /// <summary>

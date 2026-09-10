@@ -165,12 +165,12 @@ namespace UnityRemix
         
         // Mesh creation queue with pre-extracted geometry data
         private Queue<PreparedMeshData> meshesToCreate = new Queue<PreparedMeshData>();
-        private HashSet<int> meshesInQueue = new HashSet<int>(); // Track which meshes are already queued
-        private HashSet<int> failedMeshIds = new HashSet<int>(); // Meshes that failed creation (non-readable)
+        private HashSet<ulong> meshesInQueue = new HashSet<ulong>(); // Track which mesh keys are already queued
+        private HashSet<ulong> failedMeshKeys = new HashSet<ulong>(); // Mesh keys that failed creation (non-readable)
         private readonly object meshQueueLock = new object(); // Synchronize main thread enqueue + render thread dequeue
 
         // --- Diagnostic getters for debug HUD ---
-        public int FailedMeshCount { get { lock (meshQueueLock) return failedMeshIds.Count; } }
+        public int FailedMeshCount { get { lock (meshQueueLock) return failedMeshKeys.Count; } }
         public int PendingMeshQueueCount { get { lock (meshQueueLock) return meshesToCreate.Count; } }
         public int PersistentStaticCount => persistentStaticInstances.Count;
         public int CachedStaticRendererCount => cachedRenderers.Count;
@@ -236,7 +236,9 @@ namespace UnityRemix
                     continue;
                 if (IsRendererDisabled(renderer.GetInstanceID()))
                     continue;
-                if (!meshConverter.IsMeshCached(mesh.GetInstanceID()))
+                int matSig = StaticGeometryDedupe.ComputeMaterialSignature(renderer.sharedMaterials);
+                ulong meshKey = RemixMeshConverter.GetMeshKey(mesh.GetInstanceID(), matSig);
+                if (!meshConverter.IsMeshCached(meshKey))
                     continue;
 
                 stats.RawStaticMeshes++;
@@ -261,7 +263,7 @@ namespace UnityRemix
                         continue;
                     if (IsLayerDisabled(entry.renderer.gameObject.layer))
                         continue;
-                    if (!meshConverter.IsMeshCached(entry.meshId))
+                    if (!meshConverter.IsMeshCached(entry.meshKey))
                         continue;
 
                     stats.RawStaticMeshes++;
@@ -327,8 +329,10 @@ namespace UnityRemix
                 if (mf == null || mf.sharedMesh == null) continue;
 
                 int meshId = mf.sharedMesh.GetInstanceID();
-                bool failed = failedMeshIds.Contains(meshId);
-                bool cached = meshConverter.IsMeshCached(meshId);
+                int matSig = StaticGeometryDedupe.ComputeMaterialSignature(r.sharedMaterials);
+                ulong meshKey = RemixMeshConverter.GetMeshKey(meshId, matSig);
+                bool failed = failedMeshKeys.Contains(meshKey);
+                bool cached = meshConverter.IsMeshCached(meshKey);
                 if (!failed && !cached) continue; // still queued, not interesting yet
 
                 var entry = new DebugMeshEntry
@@ -432,6 +436,7 @@ namespace UnityRemix
         private struct PersistentStaticInstance
         {
             public MeshRenderer renderer; // weak ref via Unity object — becomes null when destroyed
+            public ulong meshKey;
             public int meshId;
             public Matrix4x4 localToWorld;
             public StaticGeometryKey dedupeKey;
@@ -493,6 +498,7 @@ namespace UnityRemix
         
         public struct MeshInstanceData
         {
+            public ulong meshKey;
             public int meshId;
             public Matrix4x4 localToWorld;
             public int rendererInstanceId;
@@ -585,7 +591,7 @@ namespace UnityRemix
             {
                 meshesToCreate.Clear();
                 meshesInQueue.Clear();
-                failedMeshIds.Clear();
+                failedMeshKeys.Clear();
             }
             loggedSkinnedMaterials.Clear();
             skinnedRoundRobinIndex = 0;
@@ -801,12 +807,33 @@ namespace UnityRemix
                     persistentStaticInstances.Remove(rendererInstanceId);
                     continue;
                 }
+
+                var materials = renderer.sharedMaterials;
+
+                // Skip heat glow overlays (e.g. ULTRAKILL Nailgun/Sawblade BarrelHeat overlays)
+                if (materials != null)
+                {
+                    bool isHeatOverlay = false;
+                    for (int m = 0; m < materials.Length; m++)
+                    {
+                        if (materials[m] != null && materials[m].name.IndexOf("BarrelHeat", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            isHeatOverlay = true;
+                            break;
+                        }
+                    }
+                    if (isHeatOverlay)
+                        continue;
+                }
+
+                int matSig = StaticGeometryDedupe.ComputeMaterialSignature(materials);
+                ulong meshKey = RemixMeshConverter.GetMeshKey(meshId, matSig);
                 
                 // Queue mesh for creation if not cached, not already queued, and not previously failed
                 bool needsQueue;
                 lock (meshQueueLock)
                 {
-                    needsQueue = !meshConverter.IsMeshCached(meshId) && !meshesInQueue.Contains(meshId) && !failedMeshIds.Contains(meshId);
+                    needsQueue = !meshConverter.IsMeshCached(meshKey) && !meshesInQueue.Contains(meshKey) && !failedMeshKeys.Contains(meshKey);
                 }
                 
                 if (needsQueue)
@@ -817,7 +844,6 @@ namespace UnityRemix
                     Color32[] colors = null;
                     var submeshIndices = new List<uint[]>();
                     var submeshMaterials = new List<Material>();
-                    var materials = renderer.sharedMaterials;
 
                     if (mesh.isReadable)
                     {
@@ -905,13 +931,13 @@ namespace UnityRemix
 
                     if (vertices == null || vertices.Length == 0 || submeshIndices.Count == 0)
                     {
-                        lock (meshQueueLock) { failedMeshIds.Add(meshId); }
+                        lock (meshQueueLock) { failedMeshKeys.Add(meshKey); }
                         continue;
                     }
 
                     int totalIndices = 0;
                     foreach (var sIdx in submeshIndices) totalIndices += sIdx.Length;
-                    ulong meshHash = RemixMeshConverter.GenerateMeshHash(mesh.name, vertices.Length, totalIndices);
+                    ulong meshHash = RemixMeshConverter.GenerateMeshHash(mesh.name, vertices.Length, totalIndices, matSig);
 
                     // Capture material textures (pixel data gathered here, Remix API deferred to render thread)
                     if (materials != null)
@@ -931,6 +957,7 @@ namespace UnityRemix
                     {
                         meshesToCreate.Enqueue(new PreparedMeshData
                         {
+                            MeshKey = meshKey,
                             MeshId = meshId,
                             MeshName = mesh.name,
                             MeshHash = meshHash,
@@ -941,7 +968,7 @@ namespace UnityRemix
                             SubmeshIndices = submeshIndices,
                             SubmeshMaterials = submeshMaterials
                         });
-                        meshesInQueue.Add(meshId);
+                        meshesInQueue.Add(meshKey);
                     }
                     
                     continue;
@@ -951,6 +978,7 @@ namespace UnityRemix
                 var transform = renderer.transform.localToWorldMatrix;
                 state.instances.Add(new MeshInstanceData
                 {
+                    meshKey = meshKey,
                     meshId = meshId,
                     localToWorld = transform,
                     rendererInstanceId = rendererInstanceId,
@@ -962,6 +990,7 @@ namespace UnityRemix
                 persistentStaticInstances[rendererInstanceId] = new PersistentStaticInstance
                 {
                     renderer = renderer,
+                    meshKey = meshKey,
                     meshId = meshId,
                     localToWorld = transform,
                     dedupeKey = dedupeKey
@@ -1001,7 +1030,7 @@ namespace UnityRemix
                 }
                 
                 // Skip if mesh isn't cached in Remix yet
-                if (!meshConverter.IsMeshCached(entry.meshId))
+                if (!meshConverter.IsMeshCached(entry.meshKey))
                     continue;
                 
                 // Skip if layer is disabled by user
@@ -1021,6 +1050,7 @@ namespace UnityRemix
                 // Draw with last-known transform
                 state.instances.Add(new MeshInstanceData
                 {
+                    meshKey = entry.meshKey,
                     meshId = entry.meshId,
                     localToWorld = entry.localToWorld,
                     rendererInstanceId = entry.renderer.GetInstanceID(),
@@ -1037,7 +1067,7 @@ namespace UnityRemix
             
             // Periodic tracking
             if (configDebugLogInterval.Value > 0 && staticCaptureCount % 300 == 1)
-                logger.LogInfo($"[StaticCapture] frame={frameCount} drawn={totalDrawn} persistent={persistentDrawn} total={persistentStaticInstances.Count} queued={meshesToCreate.Count} failedMeshes={failedMeshIds.Count}");
+                logger.LogInfo($"[StaticCapture] frame={frameCount} drawn={totalDrawn} persistent={persistentDrawn} total={persistentStaticInstances.Count} queued={meshesToCreate.Count} failedMeshes={failedMeshKeys.Count}");
         }
         
         /// <summary>
@@ -1069,15 +1099,15 @@ namespace UnityRemix
                 }
                 if (meshData == null) continue;
                 
-                int meshId = meshData.MeshId;
+                ulong meshKey = meshData.MeshKey != 0 ? meshData.MeshKey : (ulong)(uint)meshData.MeshId;
                 
                 // Remove from queue tracking
                 lock (meshQueueLock)
                 {
-                    meshesInQueue.Remove(meshId);
+                    meshesInQueue.Remove(meshKey);
                 }
                 
-                if (meshConverter.IsMeshCached(meshId))
+                if (meshConverter.IsMeshCached(meshKey))
                     continue;
                 
                 try
@@ -1089,7 +1119,7 @@ namespace UnityRemix
                     {
                         if (configDebugLogInterval.Value > 0)
                             logger.LogWarning($"[MeshFail] Failed to create mesh '{meshData.MeshName}' vertCount={meshData.Vertices?.Length} subMeshCount={meshData.SubmeshIndices?.Count}");
-                        lock (meshQueueLock) { failedMeshIds.Add(meshId); }
+                        lock (meshQueueLock) { failedMeshKeys.Add(meshKey); }
                     }
                     
                     // Check time budget - break if exceeded
