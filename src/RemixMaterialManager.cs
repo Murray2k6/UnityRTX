@@ -332,15 +332,27 @@ namespace UnityRemix
                     matData.wrapModeV = UnityWrapToMdl(tex.wrapModeV);
                     matData.filterMode = (byte)(tex.filterMode == FilterMode.Point ? 0 : 1);
                     
-                    matData.albedoHandle = UploadUnityTexture(tex);
+                    int texId = tex.GetInstanceID();
+                    if (mpbColor.HasValue && mpbColor.Value != Color.white)
+                    {
+                        var (tintedHandle, tintedHash) = UploadTintedEmissiveTexture(tex, mpbColor.Value);
+                        matData.albedoHandle = tintedHandle;
+                        matData.albedoTextureHash = tintedHash;
+                    }
+                    else
+                    {
+                        matData.albedoHandle = UploadUnityTexture(tex);
+                        if (matData.albedoHandle != IntPtr.Zero)
+                        {
+                            if (textureHashCache.TryGetValue(texId, out ulong hash))
+                            {
+                                matData.albedoTextureHash = hash;
+                            }
+                        }
+                    }
+                    
                     if (matData.albedoHandle != IntPtr.Zero)
                     {
-                        int texId = tex.GetInstanceID();
-                        if (textureHashCache.TryGetValue(texId, out ulong hash))
-                        {
-                            matData.albedoTextureHash = hash;
-                        }
-                        
                         // Fallback: if shader metadata says Opaque but the texture has genuine cutout
                         // transparency (large near-zero alpha regions), upgrade to Cutout.
                         // Uses texturesWithCutoutAlpha (strict: >=10% pixels at alpha<16) instead of
@@ -424,9 +436,9 @@ namespace UnityRemix
                     hasEmission = matData.emissiveIntensity > 0f || matData.emissiveHandle != IntPtr.Zero;
                 }
                 
-                // ULTRAKILL/custom shader path: _EmissiveColor, _EmissiveTex, _EmissiveIntensity
-                // Only emit if: toggle is on, OR a dedicated emission texture is assigned, OR MPB override is present
-                if (!hasEmission && material.HasProperty("_EmissiveColor"))
+                // ULTRAKILL/custom shader path: _EmissiveColor, _EmissiveTex, _EmissiveIntensity, or MPB override
+                bool hasMpbOverride = mpbEmissiveColor.HasValue || mpbColor.HasValue;
+                if (!hasEmission && (material.HasProperty("_EmissiveColor") || hasMpbOverride))
                 {
                     bool emissiveToggle = true;
                     if (material.HasProperty("EMISSIVE"))
@@ -437,12 +449,10 @@ namespace UnityRemix
                     if (material.HasProperty("_EmissiveTex"))
                         hasEmissiveTex = material.GetTexture("_EmissiveTex") != null;
                     
-                    // MPB color override also triggers emission
-                    bool hasMpbOverride = mpbEmissiveColor.HasValue || mpbColor.HasValue;
-                    
                     if (emissiveToggle || hasEmissiveTex || hasMpbOverride)
                     {
-                        matData.emissiveColor = mpbEmissiveColor ?? (mpbColor.HasValue ? mpbColor.Value : material.GetColor("_EmissiveColor"));
+                        Color defaultCol = material.HasProperty("_EmissiveColor") ? material.GetColor("_EmissiveColor") : Color.black;
+                        matData.emissiveColor = mpbEmissiveColor ?? (mpbColor.HasValue ? mpbColor.Value : defaultCol);
                         
                         if (mpbEmissiveIntensity.HasValue)
                             matData.emissiveIntensity = mpbEmissiveIntensity.Value;

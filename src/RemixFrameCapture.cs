@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using System.Threading;
 using BepInEx.Configuration;
 using BepInEx.Logging;
@@ -1541,8 +1542,99 @@ namespace UnityRemix
             }
         }
 
+        private static readonly MethodInfo _doMeshGenerationMethod = typeof(Graphic).GetMethod("DoMeshGeneration", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        private static readonly PropertyInfo _workerMeshProperty = typeof(Graphic).GetProperty("workerMesh", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+        private static Type _tmpTextType;
+        private static PropertyInfo _tmpMeshProperty;
+        private static MethodInfo _tmpForceMeshUpdateMethod;
+        private static bool _tmpReflectionChecked;
+
+        private static void EnsureTmpReflection()
+        {
+            if (_tmpReflectionChecked) return;
+            _tmpReflectionChecked = true;
+            try
+            {
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    var t = asm.GetType("TMPro.TMP_Text");
+                    if (t != null)
+                    {
+                        _tmpTextType = t;
+                        _tmpMeshProperty = t.GetProperty("mesh", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                        _tmpForceMeshUpdateMethod = t.GetMethod("ForceMeshUpdate", new Type[] { typeof(bool), typeof(bool) });
+                        if (_tmpForceMeshUpdateMethod == null)
+                            _tmpForceMeshUpdateMethod = t.GetMethod("ForceMeshUpdate", Type.EmptyTypes);
+                        break;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static bool IsExcludedHudElement(Graphic g)
+        {
+            Transform curr = g.transform;
+            while (curr != null)
+            {
+                string name = curr.name;
+                if (name.IndexOf("hud", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("guncanvas", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("style", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("crosshair", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+
+                var comps = curr.GetComponents<Component>();
+                for (int c = 0; c < comps.Length; c++)
+                {
+                    var comp = comps[c];
+                    if (comp == null) continue;
+                    string typeName = comp.GetType().Name;
+                    if (typeName.IndexOf("hud", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        typeName.Equals("StyleHUD", StringComparison.OrdinalIgnoreCase) ||
+                        typeName.Equals("HudController", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+
+                curr = curr.parent;
+            }
+            return false;
+        }
+
+        private static bool IsEquippedWeaponElement(Graphic g)
+        {
+            Transform curr = g.transform;
+            while (curr != null)
+            {
+                var comps = curr.GetComponents<Component>();
+                for (int c = 0; c < comps.Length; c++)
+                {
+                    var comp = comps[c];
+                    if (comp == null) continue;
+                    string typeName = comp.GetType().Name;
+                    if (typeName.Equals("WeaponPos", StringComparison.OrdinalIgnoreCase) ||
+                        typeName.Equals("WeaponIdentifier", StringComparison.OrdinalIgnoreCase) ||
+                        typeName.Equals("Nailgun", StringComparison.OrdinalIgnoreCase) ||
+                        typeName.Equals("Shotgun", StringComparison.OrdinalIgnoreCase) ||
+                        typeName.Equals("RocketLauncher", StringComparison.OrdinalIgnoreCase) ||
+                        typeName.Equals("Revolver", StringComparison.OrdinalIgnoreCase) ||
+                        typeName.Equals("Railcannon", StringComparison.OrdinalIgnoreCase) ||
+                        typeName.Equals("GunControl", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+                curr = curr.parent;
+            }
+            return false;
+        }
+
         /// <summary>
-        /// Captures world-space UI screens attached to weapons under main camera (e.g. Nailgun ammo counter, Shotgun slider, Rocket Launcher timer).
+        /// Captures world-space UI screens attached to equipped weapons under main camera (e.g. Nailgun ammo counter, Shotgun slider, Rocket Launcher timer).
         /// </summary>
         private void CaptureWeaponCanvasScreens(FrameState state, int frameCount)
         {
@@ -1554,25 +1646,64 @@ namespace UnityRemix
             if (graphics == null || graphics.Length == 0)
                 return;
 
+            EnsureTmpReflection();
+
             for (int i = 0; i < graphics.Length; i++)
             {
                 var g = graphics[i];
                 if (g == null || !g.enabled || !g.gameObject.activeInHierarchy)
                     continue;
 
-                var canvas = g.canvas;
-                if (canvas == null || canvas.renderMode != RenderMode.WorldSpace)
+                // Reject anything attached to the 2D HUD or overlay
+                if (IsExcludedHudElement(g))
                     continue;
 
-                var cr = g.canvasRenderer;
-                if (cr == null || cr.cull)
+                // Must be mounted on an equipped weapon
+                if (!IsEquippedWeaponElement(g))
+                    continue;
+
+                var canvas = g.canvas;
+                if (canvas == null || canvas.renderMode == RenderMode.ScreenSpaceOverlay)
                     continue;
 
                 Color col = g.color;
                 if (col.a <= 0.001f)
                     continue;
 
-                Mesh mesh = cr.GetMesh();
+                Mesh mesh = null;
+                try
+                {
+                    if (_tmpTextType != null && _tmpTextType.IsInstanceOfType(g))
+                    {
+                        if (_tmpForceMeshUpdateMethod != null)
+                        {
+                            var parms = _tmpForceMeshUpdateMethod.GetParameters();
+                            if (parms.Length == 2)
+                                _tmpForceMeshUpdateMethod.Invoke(g, new object[] { false, false });
+                            else
+                                _tmpForceMeshUpdateMethod.Invoke(g, null);
+                        }
+                        if (_tmpMeshProperty != null)
+                            mesh = (Mesh)_tmpMeshProperty.GetValue(g, null);
+                    }
+
+                    if (mesh == null || mesh.vertexCount == 0)
+                    {
+                        if (_doMeshGenerationMethod != null)
+                            _doMeshGenerationMethod.Invoke(g, null);
+                        if (_workerMeshProperty != null)
+                            mesh = (Mesh)_workerMeshProperty.GetValue(null);
+                    }
+                }
+                catch { }
+
+                if (mesh == null || mesh.vertexCount == 0)
+                {
+                    var cr = g.canvasRenderer;
+                    if (cr != null)
+                        mesh = cr.GetMesh();
+                }
+
                 Vector3[] verts = null;
                 Vector3[] normals = null;
                 Vector2[] uvs = null;
@@ -1591,6 +1722,9 @@ namespace UnityRemix
                 if (verts == null || verts.Length == 0 || tris == null || tris.Length == 0)
                 {
                     Rect r = g.rectTransform.rect;
+                    if (r.width <= 0.001f || r.height <= 0.001f)
+                        continue;
+
                     verts = new Vector3[]
                     {
                         new Vector3(r.xMin, r.yMin, 0f),
@@ -1609,10 +1743,7 @@ namespace UnityRemix
                         new Vector2(1f, 1f),
                         new Vector2(1f, 0f)
                     };
-                    colors = new Color32[]
-                    {
-                        col, col, col, col
-                    };
+                    colors = new Color32[] { col, col, col, col };
                     tris = new int[]
                     {
                         0, 1, 2,
@@ -1649,7 +1780,11 @@ namespace UnityRemix
                 Texture2D mainTex = g.mainTexture as Texture2D;
 
                 Color32 c32 = col;
-                int colHash = (c32.a << 24) | (c32.r << 16) | (c32.g << 8) | c32.b;
+                int qR = (c32.r >> 3);
+                int qG = (c32.g >> 3);
+                int qB = (c32.b >> 3);
+                int qA = (c32.a >> 3);
+                int colHash = (qA << 15) | (qR << 10) | (qG << 5) | qB;
                 int texHash = mainTex != null ? mainTex.GetInstanceID() : 0;
                 int uiMatId = HashCombine(mat.GetInstanceID(), HashCombine(texHash, colHash));
 
