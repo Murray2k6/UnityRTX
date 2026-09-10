@@ -464,8 +464,8 @@ namespace UnityRemix
                 var nextState = new RemixFrameCapture.FrameState();
                 nextState.frameCount = frameCount;
                 
-                // Refresh light cache periodically (same interval as renderer cache)
-                if (frameCount % configRendererCacheDuration.Value == 0 && lightConverter != null)
+                // Refresh light cache every frame to capture transient lights (explosions, muzzle flashes)
+                if (configEnableLights.Value && lightConverter != null)
                 {
                     lightConverter.RefreshLightCache();
                 }

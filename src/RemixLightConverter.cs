@@ -8,6 +8,23 @@ using UnityEngine;
 namespace UnityRemix
 {
     /// <summary>
+    /// Thread-safe snapshot of Unity light properties captured on the main thread.
+    /// </summary>
+    public struct UnityLightData
+    {
+        public int instanceId;
+        public ulong hash;
+        public LightType type;
+        public Color color;
+        public float intensity;
+        public float range;
+        public Vector3 position;
+        public Vector3 forward;
+        public float spotAngle;
+        public string name;
+    }
+
+    /// <summary>
     /// Converts Unity lights to Remix lights
     /// </summary>
     public class RemixLightConverter
@@ -24,10 +41,23 @@ namespace UnityRemix
         private RemixAPI.PFN_remixapi_DrawLightInstance drawLightInstanceFunc;
         
         // Cache for Unity lights - maps Light instance ID to Remix handle
-        private Dictionary<int, IntPtr> lightCache = new Dictionary<int, IntPtr>();
-        private List<Light> cachedLights = new List<Light>();
+        private readonly object cacheLock = new object();
+        private readonly Dictionary<int, IntPtr> lightCache = new Dictionary<int, IntPtr>();
 
-        public int CachedLightCount => cachedLights.Count;
+        // Thread-safe snapshot of light data transferred from main thread to render thread
+        private readonly object lightDataLock = new object();
+        private UnityLightData[] currentLightData = Array.Empty<UnityLightData>();
+
+        public int CachedLightCount
+        {
+            get
+            {
+                lock (lightDataLock)
+                {
+                    return currentLightData != null ? currentLightData.Length : 0;
+                }
+            }
+        }
         
         public RemixLightConverter(
             ManualLogSource logger,
@@ -64,15 +94,52 @@ namespace UnityRemix
         }
         
         /// <summary>
-        /// Refresh cached light list from scene
+        /// Refresh cached light list from scene (called on Unity main thread)
         /// </summary>
         public void RefreshLightCache()
         {
             if (!configEnableLights.Value)
                 return;
                 
-            cachedLights.Clear();
-            cachedLights.AddRange(UnityEngine.Object.FindObjectsOfType<Light>());
+            Light[] allLights = UnityEngine.Object.FindObjectsOfType<Light>();
+            var lightList = new List<UnityLightData>(allLights.Length);
+
+            for (int i = 0; i < allLights.Length; i++)
+            {
+                Light l = allLights[i];
+                if (l == null || !l.enabled || !l.gameObject.activeInHierarchy)
+                    continue;
+
+                Transform t = l.transform;
+                string path = HashUtils.GetHierarchyPath(t);
+                ulong hash = HashUtils.HashStringFNV(path);
+
+                // For dynamically instantiated objects (like explosions, muzzle flashes, projectiles),
+                // include instance ID in hash to avoid hash collisions between multiple clones.
+                if (path.Contains("(Clone)"))
+                {
+                    hash ^= ((ulong)(uint)l.GetInstanceID() * 1099511628211UL);
+                }
+
+                lightList.Add(new UnityLightData
+                {
+                    instanceId = l.GetInstanceID(),
+                    hash = hash,
+                    type = l.type,
+                    color = l.color,
+                    intensity = l.intensity,
+                    range = l.range,
+                    position = t.position,
+                    forward = t.forward,
+                    spotAngle = l.spotAngle,
+                    name = l.name
+                });
+            }
+
+            lock (lightDataLock)
+            {
+                currentLightData = lightList.ToArray();
+            }
         }
         
         /// <summary>
@@ -80,55 +147,124 @@ namespace UnityRemix
         /// </summary>
         public void ClearCache()
         {
-            foreach (var lightHandle in lightCache.Values)
+            lock (cacheLock)
             {
-                if (lightHandle != IntPtr.Zero && destroyLightFunc != null)
+                lock (apiLock)
                 {
-                    try { destroyLightFunc(lightHandle); } catch { }
+                    foreach (var lightHandle in lightCache.Values)
+                    {
+                        if (lightHandle != IntPtr.Zero && destroyLightFunc != null)
+                        {
+                            try { destroyLightFunc(lightHandle); } catch { }
+                        }
+                    }
                 }
+                lightCache.Clear();
             }
-            lightCache.Clear();
-            cachedLights.Clear();
+
+            lock (lightDataLock)
+            {
+                currentLightData = Array.Empty<UnityLightData>();
+            }
         }
         
         /// <summary>
-        /// Process and draw all Unity lights
+        /// Process and draw all Unity lights (runs on render thread)
         /// </summary>
         public void ProcessLights(int frameCount)
         {
-            if (!configEnableLights.Value || drawLightInstanceFunc == null || createLightFunc == null)
-                return;
-            
-            // Snapshot to avoid collection-modified if RefreshLightCache runs on main thread
-            var lightsSnapshot = cachedLights.ToArray();
-            foreach (var light in lightsSnapshot)
+            if (!configEnableLights.Value)
             {
-                if (light == null || !light.enabled || !light.gameObject.activeInHierarchy)
-                    continue;
-                
-                int lightId = light.GetInstanceID();
-                
-                // Always call CreateLight with current parameters. The Remix API
-                // updates the existing light in-place for dynamic lights (isDynamic=1),
-                // so parameter changes (intensity, position, color) apply immediately
-                // without needing destroy/recreate.
-                IntPtr lightHandle = CreateRemixLightFromUnity(light, frameCount);
-                
-                if (lightHandle != IntPtr.Zero)
+                lock (cacheLock)
                 {
-                    lightCache[lightId] = lightHandle;
-                    lock (apiLock)
+                    if (lightCache.Count > 0)
                     {
-                        drawLightInstanceFunc(lightHandle);
+                        lock (apiLock)
+                        {
+                            foreach (var handle in lightCache.Values)
+                            {
+                                if (handle != IntPtr.Zero && destroyLightFunc != null)
+                                {
+                                    try { destroyLightFunc(handle); } catch { }
+                                }
+                            }
+                        }
+                        lightCache.Clear();
+                    }
+                }
+                return;
+            }
+
+            if (drawLightInstanceFunc == null || createLightFunc == null)
+                return;
+
+            UnityLightData[] lightsSnapshot;
+            lock (lightDataLock)
+            {
+                lightsSnapshot = currentLightData;
+            }
+
+            if (lightsSnapshot == null)
+                return;
+
+            lock (cacheLock)
+            {
+                HashSet<int> activeLightIds = new HashSet<int>();
+
+                for (int i = 0; i < lightsSnapshot.Length; i++)
+                {
+                    ref UnityLightData lightData = ref lightsSnapshot[i];
+                    activeLightIds.Add(lightData.instanceId);
+
+                    IntPtr lightHandle = CreateRemixLightFromData(ref lightData, frameCount);
+
+                    if (lightHandle != IntPtr.Zero)
+                    {
+                        lightCache[lightData.instanceId] = lightHandle;
+                        lock (apiLock)
+                        {
+                            drawLightInstanceFunc(lightHandle);
+                        }
+                    }
+                }
+
+                // Destroy persistent Remix lights that are no longer active in Unity
+                if (lightCache.Count > activeLightIds.Count)
+                {
+                    List<int> toRemove = null;
+                    foreach (var kvp in lightCache)
+                    {
+                        if (!activeLightIds.Contains(kvp.Key))
+                        {
+                            if (toRemove == null)
+                                toRemove = new List<int>();
+                            toRemove.Add(kvp.Key);
+
+                            if (kvp.Value != IntPtr.Zero && destroyLightFunc != null)
+                            {
+                                lock (apiLock)
+                                {
+                                    try { destroyLightFunc(kvp.Value); } catch { }
+                                }
+                            }
+                        }
+                    }
+
+                    if (toRemove != null)
+                    {
+                        for (int i = 0; i < toRemove.Count; i++)
+                        {
+                            lightCache.Remove(toRemove[i]);
+                        }
                     }
                 }
             }
         }
         
         /// <summary>
-        /// Create Remix light from Unity light
+        /// Create Remix light from Unity light snapshot
         /// </summary>
-        private IntPtr CreateRemixLightFromUnity(Light light, int frameCount)
+        private IntPtr CreateRemixLightFromData(ref UnityLightData light, int frameCount)
         {
             if (createLightFunc == null)
                 return IntPtr.Zero;
@@ -144,7 +280,7 @@ namespace UnityRemix
                 {
                     sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_LIGHT_INFO,
                     pNext = IntPtr.Zero,
-                    hash = HashUtils.GetHierarchyHash(light.transform),
+                    hash = light.hash,
                     radiance = radiance,
                     isDynamic = 1,
                     ignoreViewModel = 0
@@ -155,11 +291,11 @@ namespace UnityRemix
                 switch (light.type)
                 {
                     case LightType.Point:
-                        lightHandle = CreatePointLight(light, lightInfo);
+                        lightHandle = CreatePointLight(ref light, lightInfo);
                         break;
                     
                     case LightType.Spot:
-                        lightHandle = CreateSpotLight(light, lightInfo);
+                        lightHandle = CreateSpotLight(ref light, lightInfo);
                         break;
                     
                     case LightType.Directional:
@@ -186,9 +322,9 @@ namespace UnityRemix
             }
         }
         
-        private IntPtr CreatePointLight(Light light, RemixAPI.remixapi_LightInfo baseInfo)
+        private IntPtr CreatePointLight(ref UnityLightData light, RemixAPI.remixapi_LightInfo baseInfo)
         {
-            var position = light.transform.position;
+            var position = light.position;
             
             var sphereExt = new RemixAPI.remixapi_LightInfoSphereEXT
             {
@@ -229,10 +365,10 @@ namespace UnityRemix
             }
         }
         
-        private IntPtr CreateSpotLight(Light light, RemixAPI.remixapi_LightInfo baseInfo)
+        private IntPtr CreateSpotLight(ref UnityLightData light, RemixAPI.remixapi_LightInfo baseInfo)
         {
-            var position = light.transform.position;
-            var direction = light.transform.forward;
+            var position = light.position;
+            var direction = light.forward;
             
             var shaping = new RemixAPI.remixapi_LightInfoLightShaping
             {
