@@ -107,7 +107,7 @@ namespace UnityRemix
             for (int i = 0; i < allLights.Length; i++)
             {
                 Light l = allLights[i];
-                if (l == null || !l.enabled || !l.gameObject.activeInHierarchy)
+                if (l == null || !l.enabled || !l.gameObject.activeInHierarchy || l.intensity <= 0.001f || l.range <= 0.001f)
                     continue;
 
                 Transform t = l.transform;
@@ -229,33 +229,30 @@ namespace UnityRemix
                 }
 
                 // Destroy persistent Remix lights that are no longer active in Unity
-                if (lightCache.Count > activeLightIds.Count)
+                List<int> toRemove = null;
+                foreach (var kvp in lightCache)
                 {
-                    List<int> toRemove = null;
-                    foreach (var kvp in lightCache)
+                    if (!activeLightIds.Contains(kvp.Key))
                     {
-                        if (!activeLightIds.Contains(kvp.Key))
-                        {
-                            if (toRemove == null)
-                                toRemove = new List<int>();
-                            toRemove.Add(kvp.Key);
+                        if (toRemove == null)
+                            toRemove = new List<int>();
+                        toRemove.Add(kvp.Key);
 
-                            if (kvp.Value != IntPtr.Zero && destroyLightFunc != null)
+                        if (kvp.Value != IntPtr.Zero && destroyLightFunc != null)
+                        {
+                            lock (apiLock)
                             {
-                                lock (apiLock)
-                                {
-                                    try { destroyLightFunc(kvp.Value); } catch { }
-                                }
+                                try { destroyLightFunc(kvp.Value); } catch { }
                             }
                         }
                     }
+                }
 
-                    if (toRemove != null)
+                if (toRemove != null)
+                {
+                    for (int i = 0; i < toRemove.Count; i++)
                     {
-                        for (int i = 0; i < toRemove.Count; i++)
-                        {
-                            lightCache.Remove(toRemove[i]);
-                        }
+                        lightCache.Remove(toRemove[i]);
                     }
                 }
             }

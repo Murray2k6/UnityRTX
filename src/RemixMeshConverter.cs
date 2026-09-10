@@ -25,6 +25,7 @@ namespace UnityRemix
         public Color32[] Colors;
         public List<uint[]> SubmeshIndices;
         public List<Material> SubmeshMaterials;
+        public List<int> SubmeshMaterialIds;
     }
 
     /// <summary>
@@ -348,9 +349,12 @@ namespace UnityRemix
                 }
 
                 ulong meshKey = data.MeshKey != 0 ? data.MeshKey : (ulong)(uint)data.MeshId;
-                if (submeshMaterials.Count > 0 && submeshMaterials[0] != null)
+                int primaryMatId = (data.SubmeshMaterialIds != null && data.SubmeshMaterialIds.Count > 0 && data.SubmeshMaterialIds[0] != 0)
+                    ? data.SubmeshMaterialIds[0]
+                    : (submeshMaterials.Count > 0 && submeshMaterials[0] != null ? submeshMaterials[0].GetInstanceID() : 0);
+                if (primaryMatId != 0)
                 {
-                    meshToMaterialMap[meshKey] = submeshMaterials[0].GetInstanceID();
+                    meshToMaterialMap[meshKey] = primaryMatId;
                 }
 
                 var surfaces = new RemixAPI.remixapi_MeshInfoSurfaceTriangles[submeshIndices.Count];
@@ -361,10 +365,14 @@ namespace UnityRemix
                     indexHandles.Add(idxHandle);
 
                     Material mat = (s < submeshMaterials.Count) ? submeshMaterials[s] : null;
+                    int targetMatId = (data.SubmeshMaterialIds != null && s < data.SubmeshMaterialIds.Count && data.SubmeshMaterialIds[s] != 0)
+                        ? data.SubmeshMaterialIds[s]
+                        : (mat != null ? mat.GetInstanceID() : 0);
+
                     IntPtr materialHandle = IntPtr.Zero;
-                    if (mat != null)
+                    if (targetMatId != 0)
                     {
-                        materialHandle = materialManager.GetOrCreateMaterial(mat.GetInstanceID());
+                        materialHandle = materialManager.GetOrCreateMaterial(targetMatId);
                     }
 
                     IntPtr vertsPtr;
@@ -373,8 +381,8 @@ namespace UnityRemix
                     if (anyNonIdentityST)
                     {
                         Vector4 st = new Vector4(1, 1, 0, 0);
-                        if (mat != null)
-                            st = materialManager.GetMainTexST(mat.GetInstanceID());
+                        if (targetMatId != 0)
+                            st = materialManager.GetMainTexST(targetMatId);
 
                         var surfVerts = new RemixAPI.remixapi_HardcodedVertex[vertices.Length];
                         for (int i = 0; i < vertices.Length; i++)

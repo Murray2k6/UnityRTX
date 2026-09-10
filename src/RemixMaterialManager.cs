@@ -241,7 +241,7 @@ namespace UnityRemix
         /// <summary>
         /// Capture textures from a Unity material, with optional per-renderer property overrides
         /// </summary>
-        public void CaptureMaterialTextures(Material material, int materialId, Color? mpbEmissiveColor = null, float? mpbEmissiveIntensity = null)
+        public void CaptureMaterialTextures(Material material, int materialId, Color? mpbEmissiveColor = null, float? mpbEmissiveIntensity = null, Texture2D mpbMainTex = null, Color? mpbColor = null)
         {
             if (material == null)
                 return;
@@ -269,7 +269,7 @@ namespace UnityRemix
             var matData = new MaterialTextureData
             {
                 materialName = material.name,
-                albedoColor = Color.white,
+                albedoColor = mpbColor ?? Color.white,
                 albedoHandle = IntPtr.Zero,
                 normalHandle = IntPtr.Zero,
                 albedoTextureHash = 0,
@@ -287,8 +287,8 @@ namespace UnityRemix
                 emissiveIntensity = 0f
             };
             
-            // Get albedo color
-            if (material.HasProperty("_Color"))
+            // Get albedo color if not overridden by MPB
+            if (!mpbColor.HasValue && material.HasProperty("_Color"))
             {
                 matData.albedoColor = material.GetColor("_Color");
             }
@@ -318,12 +318,12 @@ namespace UnityRemix
                     $"color=({matData.albedoColor.r:F3},{matData.albedoColor.g:F3},{matData.albedoColor.b:F3},{matData.albedoColor.a:F3}) " +
                     $"cutoff={matData.alphaCutoff:F3}");
             
-            // Upload albedo texture
-            Texture2D albedoTex = null;
+            // Upload albedo texture (or MPB texture override)
+            Texture2D albedoTex = mpbMainTex;
             string shaderName = material.shader != null ? material.shader.name : "null";
-            if (captureTextures.Value && material.HasProperty("_MainTex"))
+            if (captureTextures.Value && (mpbMainTex != null || material.HasProperty("_MainTex")))
             {
-                var tex = material.GetTexture("_MainTex") as Texture2D;
+                var tex = mpbMainTex != null ? mpbMainTex : (material.GetTexture("_MainTex") as Texture2D);
                 albedoTex = tex;
                 if (tex != null)
                 {
@@ -361,7 +361,7 @@ namespace UnityRemix
             
             // Fallback: no albedo texture but material has a color — create a 1x1 solid-color texture
             // so Remix renders the surface with the correct color instead of the debug checkerboard.
-            if (matData.albedoHandle == IntPtr.Zero && material.HasProperty("_Color"))
+            if (matData.albedoHandle == IntPtr.Zero && (mpbColor.HasValue || material.HasProperty("_Color")))
             {
                 matData.albedoHandle = GetOrCreateSolidColorTexture(matData.albedoColor);
                 if (matData.albedoHandle != IntPtr.Zero)
@@ -438,11 +438,11 @@ namespace UnityRemix
                         hasEmissiveTex = material.GetTexture("_EmissiveTex") != null;
                     
                     // MPB color override also triggers emission
-                    bool hasMpbOverride = mpbEmissiveColor.HasValue;
+                    bool hasMpbOverride = mpbEmissiveColor.HasValue || mpbColor.HasValue;
                     
                     if (emissiveToggle || hasEmissiveTex || hasMpbOverride)
                     {
-                        matData.emissiveColor = mpbEmissiveColor ?? material.GetColor("_EmissiveColor");
+                        matData.emissiveColor = mpbEmissiveColor ?? (mpbColor.HasValue ? mpbColor.Value : material.GetColor("_EmissiveColor"));
                         
                         if (mpbEmissiveIntensity.HasValue)
                             matData.emissiveIntensity = mpbEmissiveIntensity.Value;
@@ -451,7 +451,7 @@ namespace UnityRemix
                         else
                         {
                             float maxCh = Mathf.Max(matData.emissiveColor.r, Mathf.Max(matData.emissiveColor.g, matData.emissiveColor.b));
-                            matData.emissiveIntensity = maxCh;
+                            matData.emissiveIntensity = maxCh > 0f ? maxCh : 1.0f;
                         }
                         
                         // Upload _EmissiveTex if present, pre-tinted by emission color
@@ -466,10 +466,9 @@ namespace UnityRemix
                             }
                         }
                         
-                        // _UseAlbedoAsEmissive only when toggle is on (not just default property value)
-                        if (emissiveToggle && matData.emissiveHandle == IntPtr.Zero
-                            && material.HasProperty("_UseAlbedoAsEmissive")
-                            && material.GetFloat("_UseAlbedoAsEmissive") > 0.5f
+                        // _UseAlbedoAsEmissive when toggle is on or when MPB display override is present
+                        if ((emissiveToggle || hasMpbOverride) && matData.emissiveHandle == IntPtr.Zero
+                            && ((material.HasProperty("_UseAlbedoAsEmissive") && material.GetFloat("_UseAlbedoAsEmissive") > 0.5f) || hasMpbOverride)
                             && matData.albedoHandle != IntPtr.Zero)
                         {
                             if (albedoTex != null)

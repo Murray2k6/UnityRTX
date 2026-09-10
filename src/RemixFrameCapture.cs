@@ -4,6 +4,7 @@ using System.Threading;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using UnityEngine;
+using UnityEngine.UI;
 using UnityEngine.Rendering;
 using Unity.Collections.LowLevel.Unsafe;
 
@@ -169,8 +170,9 @@ namespace UnityRemix
         private Queue<PreparedMeshData> meshesToCreate = new Queue<PreparedMeshData>();
         private Queue<PreparedMeshData> priorityMeshesToCreate = new Queue<PreparedMeshData>(); // High-priority queue for viewmodel/weapon meshes
         private HashSet<ulong> meshesInQueue = new HashSet<ulong>(); // Track which mesh keys are already queued
-        private HashSet<ulong> failedMeshKeys = new HashSet<ulong>(); // Mesh keys that failed creation (non-readable)
+        private HashSet<ulong> failedMeshKeys = new HashSet<ulong>();
         private readonly object meshQueueLock = new object(); // Synchronize main thread enqueue + render thread dequeue
+        private MaterialPropertyBlock sharedStaticMpb = null;
 
         // --- Diagnostic getters for debug HUD ---
         public int FailedMeshCount { get { lock (meshQueueLock) return failedMeshKeys.Count; } }
@@ -885,7 +887,46 @@ namespace UnityRemix
                         continue;
                 }
 
+                Texture mpbMainTex = null;
+                Color? mpbColor = null;
+                Color? mpbEmissive = null;
+                int mpbHash = 0;
+
+                if (sharedStaticMpb == null)
+                    sharedStaticMpb = new MaterialPropertyBlock();
+
+                if (renderer.HasPropertyBlock())
+                {
+                    renderer.GetPropertyBlock(sharedStaticMpb);
+                    Texture tex = sharedStaticMpb.GetTexture("_MainTex");
+                    if (tex != null)
+                    {
+                        mpbMainTex = tex;
+                        mpbHash = HashCombine(mpbHash, tex.GetInstanceID());
+                    }
+                    Color col = sharedStaticMpb.GetColor("_Color");
+                    if (col.a > 0f || col.r > 0f || col.g > 0f || col.b > 0f)
+                    {
+                        mpbColor = col;
+                        Color32 c32 = col;
+                        int colInt = (c32.a << 24) | (c32.r << 16) | (c32.g << 8) | c32.b;
+                        mpbHash = HashCombine(mpbHash, colInt);
+                    }
+                    Color emis = sharedStaticMpb.GetColor("_EmissiveColor");
+                    if (emis.a > 0f || emis.r > 0f || emis.g > 0f || emis.b > 0f)
+                    {
+                        mpbEmissive = emis;
+                        Color32 e32 = emis;
+                        int emisInt = (e32.a << 24) | (e32.r << 16) | (e32.g << 8) | e32.b;
+                        mpbHash = HashCombine(mpbHash, emisInt);
+                    }
+                }
+
                 int matSig = StaticGeometryDedupe.ComputeMaterialSignature(materials);
+                if (mpbHash != 0)
+                {
+                    matSig = HashCombine(matSig, mpbHash);
+                }
                 ulong meshKey = RemixMeshConverter.GetMeshKey(meshId, matSig);
                 
                 // Queue mesh for creation if not cached, not already queued, and not previously failed
@@ -999,14 +1040,25 @@ namespace UnityRemix
                     ulong meshHash = RemixMeshConverter.GenerateMeshHash(mesh.name, vertices.Length, totalIndices, matSig);
 
                     // Capture material textures (pixel data gathered here, Remix API deferred to render thread)
+                    List<int> submeshMaterialIds = null;
                     if (materials != null)
                     {
+                        submeshMaterialIds = new List<int>(materials.Length);
                         for (int m = 0; m < materials.Length; m++)
                         {
                             if (materials[m] != null)
                             {
                                 int matId = materials[m].GetInstanceID();
-                                materialManager.CaptureMaterialTextures(materials[m], matId);
+                                if (mpbHash != 0)
+                                {
+                                    matId = HashCombine(matId, mpbHash);
+                                }
+                                submeshMaterialIds.Add(matId);
+                                materialManager.CaptureMaterialTextures(materials[m], matId, mpbEmissive, null, mpbMainTex as Texture2D, mpbColor);
+                            }
+                            else
+                            {
+                                submeshMaterialIds.Add(0);
                             }
                         }
                     }
@@ -1025,7 +1077,8 @@ namespace UnityRemix
                         UVs = uvs,
                         Colors = colors,
                         SubmeshIndices = submeshIndices,
-                        SubmeshMaterials = submeshMaterials
+                        SubmeshMaterials = submeshMaterials,
+                        SubmeshMaterialIds = submeshMaterialIds
                     };
 
                     lock (meshQueueLock)
@@ -1041,7 +1094,8 @@ namespace UnityRemix
                         meshesInQueue.Add(meshKey);
                     }
                     
-                    continue;
+                    if (!isViewModel)
+                        continue;
                 }
                 
                 // Add instance
@@ -1476,11 +1530,155 @@ namespace UnityRemix
                 }
             }
             
+            // Capture world-space weapon UI screens (e.g. Nailgun ammo counter/heat, Shotgun slider, Rocket Launcher timer)
+            CaptureWeaponCanvasScreens(state, frameCount);
+            
             if (doLog && total > 0)
             {
                 logger.LogInfo($"CaptureSkinnedMeshes: gpuSkinned={gpuSkinned}, baked={baked}, " +
                     $"skip(null={skipNull},layer={skipLayer},vis={skipVis},dist={skipDist},mesh={skipNoMesh}), " +
                     $"cached={persistentSkinnedData.Count}, total={total}");
+            }
+        }
+
+        /// <summary>
+        /// Captures world-space UI screens attached to weapons under main camera (e.g. Nailgun ammo counter, Shotgun slider, Rocket Launcher timer).
+        /// </summary>
+        private void CaptureWeaponCanvasScreens(FrameState state, int frameCount)
+        {
+            Camera mainCam = cameraHandler?.GetPreferredCamera();
+            if (mainCam == null)
+                return;
+
+            var graphics = mainCam.GetComponentsInChildren<Graphic>(false);
+            if (graphics == null || graphics.Length == 0)
+                return;
+
+            for (int i = 0; i < graphics.Length; i++)
+            {
+                var g = graphics[i];
+                if (g == null || !g.enabled || !g.gameObject.activeInHierarchy)
+                    continue;
+
+                var canvas = g.canvas;
+                if (canvas == null || canvas.renderMode != RenderMode.WorldSpace)
+                    continue;
+
+                var cr = g.canvasRenderer;
+                if (cr == null || cr.cull)
+                    continue;
+
+                Color col = g.color;
+                if (col.a <= 0.001f)
+                    continue;
+
+                Mesh mesh = cr.GetMesh();
+                Vector3[] verts = null;
+                Vector3[] normals = null;
+                Vector2[] uvs = null;
+                Color32[] colors = null;
+                int[] tris = null;
+
+                if (mesh != null && mesh.vertexCount > 0)
+                {
+                    verts = mesh.vertices;
+                    normals = mesh.normals;
+                    uvs = mesh.uv;
+                    colors = mesh.colors32;
+                    tris = mesh.triangles;
+                }
+
+                if (verts == null || verts.Length == 0 || tris == null || tris.Length == 0)
+                {
+                    Rect r = g.rectTransform.rect;
+                    verts = new Vector3[]
+                    {
+                        new Vector3(r.xMin, r.yMin, 0f),
+                        new Vector3(r.xMin, r.yMax, 0f),
+                        new Vector3(r.xMax, r.yMax, 0f),
+                        new Vector3(r.xMax, r.yMin, 0f)
+                    };
+                    normals = new Vector3[]
+                    {
+                        Vector3.back, Vector3.back, Vector3.back, Vector3.back
+                    };
+                    uvs = new Vector2[]
+                    {
+                        new Vector2(0f, 0f),
+                        new Vector2(0f, 1f),
+                        new Vector2(1f, 1f),
+                        new Vector2(1f, 0f)
+                    };
+                    colors = new Color32[]
+                    {
+                        col, col, col, col
+                    };
+                    tris = new int[]
+                    {
+                        0, 1, 2,
+                        0, 2, 3
+                    };
+                }
+
+                if (normals == null || normals.Length != verts.Length)
+                {
+                    normals = new Vector3[verts.Length];
+                    for (int n = 0; n < normals.Length; n++)
+                        normals[n] = Vector3.back;
+                }
+
+                if (uvs == null || uvs.Length != verts.Length)
+                {
+                    uvs = new Vector2[verts.Length];
+                }
+
+                if (colors == null || colors.Length != verts.Length)
+                {
+                    colors = new Color32[verts.Length];
+                    Color32 c = col;
+                    for (int cIdx = 0; cIdx < colors.Length; cIdx++)
+                        colors[cIdx] = c;
+                }
+
+                Material mat = g.materialForRendering;
+                if (mat == null)
+                    mat = g.defaultMaterial;
+                if (mat == null)
+                    continue;
+
+                Texture2D mainTex = g.mainTexture as Texture2D;
+
+                Color32 c32 = col;
+                int colHash = (c32.a << 24) | (c32.r << 16) | (c32.g << 8) | c32.b;
+                int texHash = mainTex != null ? mainTex.GetInstanceID() : 0;
+                int uiMatId = HashCombine(mat.GetInstanceID(), HashCombine(texHash, colHash));
+
+                materialManager.CaptureMaterialTextures(
+                    mat,
+                    uiMatId,
+                    mpbEmissiveColor: col,
+                    mpbEmissiveIntensity: 1.0f,
+                    mpbMainTex: mainTex,
+                    mpbColor: col
+                );
+
+                int graphicId = g.GetInstanceID();
+                ulong remixMeshHash = (ulong)(uint)graphicId | 0x8000000000000000UL;
+
+                state.skinned.Add(new SkinnedMeshData
+                {
+                    meshId = graphicId,
+                    remixMeshHash = remixMeshHash,
+                    materialId = uiMatId,
+                    vertices = verts,
+                    normals = normals,
+                    uvs = uvs,
+                    colors = colors,
+                    triangles = tris,
+                    localToWorld = g.rectTransform.localToWorldMatrix,
+                    boneTransforms = null,
+                    skinningData = null
+                });
             }
         }
         
