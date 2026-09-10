@@ -32,6 +32,8 @@ namespace UnityRemix
         // Renderer caching
         private List<MeshRenderer> cachedRenderers = new List<MeshRenderer>();
         private List<SkinnedMeshRenderer> cachedSkinnedRenderers = new List<SkinnedMeshRenderer>();
+        private readonly HashSet<int> cachedRendererIds = new HashSet<int>();
+        private readonly HashSet<int> cachedSkinnedRendererIds = new HashSet<int>();
         private int rendererCacheFrame = -1;
         
         // Cached baked meshes for skinned renderers
@@ -165,13 +167,14 @@ namespace UnityRemix
         
         // Mesh creation queue with pre-extracted geometry data
         private Queue<PreparedMeshData> meshesToCreate = new Queue<PreparedMeshData>();
+        private Queue<PreparedMeshData> priorityMeshesToCreate = new Queue<PreparedMeshData>(); // High-priority queue for viewmodel/weapon meshes
         private HashSet<ulong> meshesInQueue = new HashSet<ulong>(); // Track which mesh keys are already queued
         private HashSet<ulong> failedMeshKeys = new HashSet<ulong>(); // Mesh keys that failed creation (non-readable)
         private readonly object meshQueueLock = new object(); // Synchronize main thread enqueue + render thread dequeue
 
         // --- Diagnostic getters for debug HUD ---
         public int FailedMeshCount { get { lock (meshQueueLock) return failedMeshKeys.Count; } }
-        public int PendingMeshQueueCount { get { lock (meshQueueLock) return meshesToCreate.Count; } }
+        public int PendingMeshQueueCount { get { lock (meshQueueLock) return meshesToCreate.Count + priorityMeshesToCreate.Count; } }
         public int PersistentStaticCount => persistentStaticInstances.Count;
         public int CachedStaticRendererCount => cachedRenderers.Count;
         public int CachedSkinnedRendererCount => cachedSkinnedRenderers.Count;
@@ -586,10 +589,13 @@ namespace UnityRemix
             rendererCacheFrame = -1;
             cachedRenderers.Clear();
             cachedSkinnedRenderers.Clear();
+            cachedRendererIds.Clear();
+            cachedSkinnedRendererIds.Clear();
             lastSkinnedTransforms.Clear();
             lock (meshQueueLock)
             {
                 meshesToCreate.Clear();
+                priorityMeshesToCreate.Clear();
                 meshesInQueue.Clear();
                 failedMeshKeys.Clear();
             }
@@ -606,17 +612,36 @@ namespace UnityRemix
         }
         
         /// <summary>
-        /// Refresh renderer cache
+        /// Refresh renderer cache (includes inactive renderers so newly activated weapons/objects are tracked immediately)
         /// </summary>
         private void RefreshRendererCache(int frameCount)
         {
             cachedRenderers.Clear();
             cachedSkinnedRenderers.Clear();
+            cachedRendererIds.Clear();
+            cachedSkinnedRendererIds.Clear();
             skinnedRoundRobinIndex = 0;
             // Don't clear configuredBufferTargets — the property persists on the component
             
-            cachedRenderers.AddRange(UnityEngine.Object.FindObjectsOfType<MeshRenderer>());
-            cachedSkinnedRenderers.AddRange(UnityEngine.Object.FindObjectsOfType<SkinnedMeshRenderer>());
+            var allStatic = UnityEngine.Object.FindObjectsOfType<MeshRenderer>(true);
+            for (int i = 0; i < allStatic.Length; i++)
+            {
+                var r = allStatic[i];
+                if (r != null && cachedRendererIds.Add(r.GetInstanceID()))
+                {
+                    cachedRenderers.Add(r);
+                }
+            }
+
+            var allSkinned = UnityEngine.Object.FindObjectsOfType<SkinnedMeshRenderer>(true);
+            for (int i = 0; i < allSkinned.Length; i++)
+            {
+                var sr = allSkinned[i];
+                if (sr != null && cachedSkinnedRendererIds.Add(sr.GetInstanceID()))
+                {
+                    cachedSkinnedRenderers.Add(sr);
+                }
+            }
             
             rendererCacheFrame = frameCount;
             
@@ -729,6 +754,35 @@ namespace UnityRemix
         }
         
         /// <summary>
+        /// Ensures all active renderers parented under the camera (viewmodels, weapons, arms) are tracked immediately.
+        /// This avoids any delay when switching weapons or activating arms.
+        /// </summary>
+        public void EnsureCameraRenderersTracked(Camera cam)
+        {
+            if (cam == null) return;
+            
+            var childRenderers = cam.GetComponentsInChildren<MeshRenderer>(false);
+            for (int i = 0; i < childRenderers.Length; i++)
+            {
+                var r = childRenderers[i];
+                if (r != null && cachedRendererIds.Add(r.GetInstanceID()))
+                {
+                    cachedRenderers.Add(r);
+                }
+            }
+            
+            var childSkinned = cam.GetComponentsInChildren<SkinnedMeshRenderer>(false);
+            for (int i = 0; i < childSkinned.Length; i++)
+            {
+                var sr = childSkinned[i];
+                if (sr != null && cachedSkinnedRendererIds.Add(sr.GetInstanceID()))
+                {
+                    cachedSkinnedRenderers.Add(sr);
+                }
+            }
+        }
+
+        /// <summary>
         /// Capture static meshes from scene
         /// </summary>
         public void CaptureStaticMeshes(FrameState state, int frameCount)
@@ -742,6 +796,11 @@ namespace UnityRemix
             // Get camera
             Camera mainCam = cameraHandler.GetPreferredCamera();
             Vector3 camPos = mainCam != null ? mainCam.transform.position : Vector3.zero;
+
+            if (mainCam != null)
+            {
+                EnsureCameraRenderersTracked(mainCam);
+            }
             
             // Capture camera
             if (mainCam != null)
@@ -952,22 +1011,33 @@ namespace UnityRemix
                         }
                     }
                     
+                    bool isViewModel = mainCam != null && renderer.transform.IsChildOf(mainCam.transform);
+
                     // Queue pre-extracted mesh data
+                    var preparedData = new PreparedMeshData
+                    {
+                        MeshKey = meshKey,
+                        MeshId = meshId,
+                        MeshName = mesh.name,
+                        MeshHash = meshHash,
+                        Vertices = vertices,
+                        Normals = normals,
+                        UVs = uvs,
+                        Colors = colors,
+                        SubmeshIndices = submeshIndices,
+                        SubmeshMaterials = submeshMaterials
+                    };
+
                     lock (meshQueueLock)
                     {
-                        meshesToCreate.Enqueue(new PreparedMeshData
+                        if (isViewModel)
                         {
-                            MeshKey = meshKey,
-                            MeshId = meshId,
-                            MeshName = mesh.name,
-                            MeshHash = meshHash,
-                            Vertices = vertices,
-                            Normals = normals,
-                            UVs = uvs,
-                            Colors = colors,
-                            SubmeshIndices = submeshIndices,
-                            SubmeshMaterials = submeshMaterials
-                        });
+                            priorityMeshesToCreate.Enqueue(preparedData);
+                        }
+                        else
+                        {
+                            meshesToCreate.Enqueue(preparedData);
+                        }
                         meshesInQueue.Add(meshKey);
                     }
                     
@@ -986,15 +1056,20 @@ namespace UnityRemix
                 });
                 totalDrawn++;
                 
-                // Remember this renderer's transform so we can keep drawing it if it gets disabled
-                persistentStaticInstances[rendererInstanceId] = new PersistentStaticInstance
+                // Remember this renderer's transform so we can keep drawing it if it gets disabled.
+                // Do NOT persist viewmodels/weapons (they should disappear when unequipped).
+                bool isCurrentViewModel = mainCam != null && renderer.transform.IsChildOf(mainCam.transform);
+                if (!isCurrentViewModel)
                 {
-                    renderer = renderer,
-                    meshKey = meshKey,
-                    meshId = meshId,
-                    localToWorld = transform,
-                    dedupeKey = dedupeKey
-                };
+                    persistentStaticInstances[rendererInstanceId] = new PersistentStaticInstance
+                    {
+                        renderer = renderer,
+                        meshKey = meshKey,
+                        meshId = meshId,
+                        localToWorld = transform,
+                        dedupeKey = dedupeKey
+                    };
+                }
             }
             
             // Draw persistent instances for disabled (but not destroyed) renderers.
@@ -1078,6 +1153,37 @@ namespace UnityRemix
             // Upload any textures queued by the main thread before creating meshes/materials
             materialManager.ProcessPendingTextureUploads();
             
+            // First process high-priority viewmodel/weapon meshes immediately so they appear without delay
+            while (true)
+            {
+                PreparedMeshData prioData = null;
+                lock (meshQueueLock)
+                {
+                    if (priorityMeshesToCreate.Count > 0)
+                        prioData = priorityMeshesToCreate.Dequeue();
+                }
+                if (prioData == null) break;
+                
+                ulong meshKey = prioData.MeshKey != 0 ? prioData.MeshKey : (ulong)(uint)prioData.MeshId;
+                lock (meshQueueLock) { meshesInQueue.Remove(meshKey); }
+                if (meshConverter.IsMeshCached(meshKey)) continue;
+                
+                try
+                {
+                    IntPtr handle = meshConverter.CreateRemixMeshFromPrepared(prioData);
+                    if (handle == IntPtr.Zero)
+                    {
+                        if (configDebugLogInterval.Value > 0)
+                            logger.LogWarning($"[MeshFail] Failed to create priority viewmodel mesh '{prioData.MeshName}'");
+                        lock (meshQueueLock) { failedMeshKeys.Add(meshKey); }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning($"Exception creating priority viewmodel mesh: {ex.Message}");
+                }
+            }
+
             // Adaptive batch size based on queue length
             int batchSize;
             lock (meshQueueLock)
@@ -1162,6 +1268,11 @@ namespace UnityRemix
             
             Camera mainCam = cameraHandler.GetPreferredCamera();
             Vector3 camPos = mainCam != null ? mainCam.transform.position : Vector3.zero;
+
+            if (mainCam != null)
+            {
+                EnsureCameraRenderersTracked(mainCam);
+            }
             
             // BakeMesh fallback budget
             var bakeSw = System.Diagnostics.Stopwatch.StartNew();
