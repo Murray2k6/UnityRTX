@@ -436,7 +436,7 @@ namespace UnityRemix
                     hasEmission = matData.emissiveIntensity > 0f || matData.emissiveHandle != IntPtr.Zero;
                 }
                 
-                // ULTRAKILL/custom shader path: _EmissiveColor, _EmissiveTex, _EmissiveIntensity, or MPB override
+                // Custom shader path: _EmissiveColor, _EmissiveTex, _EmissiveIntensity, or MPB override
                 bool hasMpbOverride = mpbEmissiveColor.HasValue || mpbColor.HasValue;
                 if (!hasEmission && (material.HasProperty("_EmissiveColor") || hasMpbOverride))
                 {

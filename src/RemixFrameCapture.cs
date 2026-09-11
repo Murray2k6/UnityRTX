@@ -872,22 +872,6 @@ namespace UnityRemix
 
                 var materials = renderer.sharedMaterials;
 
-                // Skip heat glow overlays (e.g. ULTRAKILL Nailgun/Sawblade BarrelHeat overlays)
-                if (materials != null)
-                {
-                    bool isHeatOverlay = false;
-                    for (int m = 0; m < materials.Length; m++)
-                    {
-                        if (materials[m] != null && materials[m].name.IndexOf("BarrelHeat", StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            isHeatOverlay = true;
-                            break;
-                        }
-                    }
-                    if (isHeatOverlay)
-                        continue;
-                }
-
                 Texture mpbMainTex = null;
                 Color? mpbColor = null;
                 Color? mpbEmissive = null;
@@ -1579,25 +1563,10 @@ namespace UnityRemix
             {
                 string name = curr.name;
                 if (name.IndexOf("hud", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    name.IndexOf("guncanvas", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    name.IndexOf("style", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("overlay", StringComparison.OrdinalIgnoreCase) >= 0 ||
                     name.IndexOf("crosshair", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
                     return true;
-                }
-
-                var comps = curr.GetComponents<Component>();
-                for (int c = 0; c < comps.Length; c++)
-                {
-                    var comp = comps[c];
-                    if (comp == null) continue;
-                    string typeName = comp.GetType().Name;
-                    if (typeName.IndexOf("hud", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        typeName.Equals("StyleHUD", StringComparison.OrdinalIgnoreCase) ||
-                        typeName.Equals("HudController", StringComparison.OrdinalIgnoreCase))
-                    {
-                        return true;
-                    }
                 }
 
                 curr = curr.parent;
@@ -1607,34 +1576,16 @@ namespace UnityRemix
 
         private static bool IsEquippedWeaponElement(Graphic g)
         {
-            Transform curr = g.transform;
-            while (curr != null)
-            {
-                var comps = curr.GetComponents<Component>();
-                for (int c = 0; c < comps.Length; c++)
-                {
-                    var comp = comps[c];
-                    if (comp == null) continue;
-                    string typeName = comp.GetType().Name;
-                    if (typeName.Equals("WeaponPos", StringComparison.OrdinalIgnoreCase) ||
-                        typeName.Equals("WeaponIdentifier", StringComparison.OrdinalIgnoreCase) ||
-                        typeName.Equals("Nailgun", StringComparison.OrdinalIgnoreCase) ||
-                        typeName.Equals("Shotgun", StringComparison.OrdinalIgnoreCase) ||
-                        typeName.Equals("RocketLauncher", StringComparison.OrdinalIgnoreCase) ||
-                        typeName.Equals("Revolver", StringComparison.OrdinalIgnoreCase) ||
-                        typeName.Equals("Railcannon", StringComparison.OrdinalIgnoreCase) ||
-                        typeName.Equals("GunControl", StringComparison.OrdinalIgnoreCase))
-                    {
-                        return true;
-                    }
-                }
-                curr = curr.parent;
-            }
-            return false;
+            // Must be rendered by a non-overlay Canvas that moves with the viewmodel/camera hierarchy
+            var canvas = g.canvas;
+            if (canvas == null || canvas.renderMode == RenderMode.ScreenSpaceOverlay)
+                return false;
+
+            return true;
         }
 
         /// <summary>
-        /// Captures world-space UI screens attached to equipped weapons under main camera (e.g. Nailgun ammo counter, Shotgun slider, Rocket Launcher timer).
+        /// Captures world-space UI screens attached to viewmodels or camera hierarchy (e.g. digital ammo counters, holographic weapon displays).
         /// </summary>
         private void CaptureWeaponCanvasScreens(FrameState state, int frameCount)
         {
@@ -2401,7 +2352,7 @@ namespace UnityRemix
             {
                 matId = bestMaterial.GetInstanceID();
                 
-                // Check for MaterialPropertyBlock overrides (ULTRAKILL uses these for per-weapon emission colors)
+                // Check for MaterialPropertyBlock overrides (used by games for dynamic per-renderer colors/emission)
                 Color? mpbEmissiveColor = null;
                 float? mpbEmissiveIntensity = null;
                 try
