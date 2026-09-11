@@ -11,6 +11,7 @@ namespace UnityRemix
     /// Refactored from 3309 lines to ~350 lines of orchestration code
     /// </summary>
     [BepInPlugin(PluginGUID, PluginName, PluginVersion)]
+    [DefaultExecutionOrder(int.MaxValue)]
     public class UnityRemixPlugin : BaseUnityPlugin
     {
         public const string PluginGUID = "com.Unity.remix";
@@ -481,6 +482,9 @@ namespace UnityRemix
                 
                 // Capture skinned meshes
                 frameCapture.CaptureSkinnedMeshes(nextState, frameCount);
+
+                // Capture dynamic non-skinned effects (weapon screens, line/trail beams, sprites, blood decals, particles)
+                frameCapture.CaptureDynamicEffects(nextState, frameCount);
                 
                 // Update scene scan visibility with the camera position resolved by CaptureStaticMeshes
                 if (sceneMeshScanner != null)

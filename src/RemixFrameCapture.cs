@@ -42,6 +42,12 @@ namespace UnityRemix
         private Dictionary<int, Mesh> bakedMeshes = new Dictionary<int, Mesh>();
         private Dictionary<int, Matrix4x4> lastSkinnedTransforms = new Dictionary<int, Matrix4x4>();
         
+        // Reusable mesh and materials for dynamic line/sprite capture
+        private Mesh sharedTempLineMesh;
+        private Material fallbackSpriteMaterial;
+        private const int MAX_LINE_SLOTS = 32;
+        private const int MAX_SPRITE_SLOTS = 32;
+        
         // Thread-safe renderer snapshots for UI
         private LayerSnapshot[] _layerSnapshots = Array.Empty<LayerSnapshot>();
         
@@ -898,6 +904,7 @@ namespace UnityRemix
 
                 if (renderer.HasPropertyBlock())
                 {
+                    sharedStaticMpb.Clear();
                     renderer.GetPropertyBlock(sharedStaticMpb);
                     Texture tex = sharedStaticMpb.GetTexture("_MainTex");
                     if (tex != null)
@@ -918,6 +925,13 @@ namespace UnityRemix
                     {
                         mpbEmissive = emis;
                         Color32 e32 = emis;
+                        int emisInt = (e32.a << 24) | (e32.r << 16) | (e32.g << 8) | e32.b;
+                        mpbHash = HashCombine(mpbHash, emisInt);
+                    }
+                    else if (mpbColor.HasValue && mainCam != null && renderer.transform.IsChildOf(mainCam.transform))
+                    {
+                        mpbEmissive = mpbColor.Value;
+                        Color32 e32 = mpbColor.Value;
                         int emisInt = (e32.a << 24) | (e32.r << 16) | (e32.g << 8) | e32.b;
                         mpbHash = HashCombine(mpbHash, emisInt);
                     }
@@ -1041,6 +1055,9 @@ namespace UnityRemix
                     ulong meshHash = RemixMeshConverter.GenerateMeshHash(mesh.name, vertices.Length, totalIndices, matSig);
 
                     // Capture material textures (pixel data gathered here, Remix API deferred to render thread)
+                    bool isViewModel = mainCam != null && renderer.transform.IsChildOf(mainCam.transform);
+                    float? emIntensity = (isViewModel && mpbEmissive.HasValue) ? 2.5f : (float?)null;
+
                     List<int> submeshMaterialIds = null;
                     if (materials != null)
                     {
@@ -1055,7 +1072,7 @@ namespace UnityRemix
                                     matId = HashCombine(matId, mpbHash);
                                 }
                                 submeshMaterialIds.Add(matId);
-                                materialManager.CaptureMaterialTextures(materials[m], matId, mpbEmissive, null, mpbMainTex as Texture2D, mpbColor);
+                                materialManager.CaptureMaterialTextures(materials[m], matId, mpbEmissive, emIntensity, mpbMainTex as Texture2D, mpbColor);
                             }
                             else
                             {
@@ -1063,8 +1080,6 @@ namespace UnityRemix
                             }
                         }
                     }
-                    
-                    bool isViewModel = mainCam != null && renderer.transform.IsChildOf(mainCam.transform);
 
                     // Queue pre-extracted mesh data
                     var preparedData = new PreparedMeshData
@@ -1531,9 +1546,7 @@ namespace UnityRemix
                 }
             }
             
-            // Capture world-space weapon UI screens (e.g. Nailgun ammo counter/heat, Shotgun slider, Rocket Launcher timer)
-            CaptureWeaponCanvasScreens(state, frameCount);
-            
+
             if (doLog && total > 0)
             {
                 logger.LogInfo($"CaptureSkinnedMeshes: gpuSkinned={gpuSkinned}, baked={baked}, " +
@@ -1763,38 +1776,84 @@ namespace UnityRemix
                     uvs = new Vector2[verts.Length];
                 }
 
+                // Encode g.color into vertex colors so each graphic's tint is preserved.
+                // The material ID is static (mat+tex hash only), so per-graphic color goes into vertex buffer.
                 if (colors == null || colors.Length != verts.Length)
                 {
+                    Color32 c = col; // col == g.color captured above
                     colors = new Color32[verts.Length];
-                    Color32 c = col;
                     for (int cIdx = 0; cIdx < colors.Length; cIdx++)
                         colors[cIdx] = c;
                 }
+                else
+                {
+                    // Multiply existing mesh vertex colors by g.color to apply tint
+                    byte tr = (byte)Mathf.RoundToInt(col.r * 255f);
+                    byte tg = (byte)Mathf.RoundToInt(col.g * 255f);
+                    byte tb = (byte)Mathf.RoundToInt(col.b * 255f);
+                    byte ta = (byte)Mathf.RoundToInt(col.a * 255f);
+                    for (int cIdx = 0; cIdx < colors.Length; cIdx++)
+                    {
+                        colors[cIdx] = new Color32(
+                            (byte)((colors[cIdx].r * tr) / 255),
+                            (byte)((colors[cIdx].g * tg) / 255),
+                            (byte)((colors[cIdx].b * tb) / 255),
+                            (byte)((colors[cIdx].a * ta) / 255)
+                        );
+                    }
+                }
 
-                Material mat = g.materialForRendering;
-                if (mat == null)
-                    mat = g.defaultMaterial;
-                if (mat == null)
-                    continue;
+                // IMPORTANT: Use g.materialForRendering for the texture lookup but g.defaultMaterial
+                // for the material ID hash. g.materialForRendering can return an instanced material
+                // clone (different GetInstanceID every frame) which would flood Remix's material table.
+                Material sharedMat = g.defaultMaterial;
+                if (sharedMat == null) continue;
 
+                // For the actual texture we want from this graphic, use its mainTexture directly
                 Texture2D mainTex = g.mainTexture as Texture2D;
 
-                Color32 c32 = col;
-                int qR = (c32.r >> 3);
-                int qG = (c32.g >> 3);
-                int qB = (c32.b >> 3);
-                int qA = (c32.a >> 3);
-                int colHash = (qA << 15) | (qR << 10) | (qG << 5) | qB;
+                // Try to read the actual canvas renderer color in case the graphic color doesn't reflect
+                // the true tint (e.g. Revolver battery MeshRenderer sets MPB _Color, not g.color)
+                Color crColor = col;
+                var cr2 = g.canvasRenderer;
+                if (cr2 != null)
+                    crColor = cr2.GetColor();
+                // If canvas renderer color is still white, keep using g.color (col)
+                if (crColor.r > 0.98f && crColor.g > 0.98f && crColor.b > 0.98f && crColor.a > 0.98f)
+                    crColor = col;
+
+                // Re-apply vertex colors using the canvas renderer color (more accurate tint source)
+                if (crColor != col && crColor != Color.white)
+                {
+                    byte tr2 = (byte)Mathf.RoundToInt(crColor.r * 255f);
+                    byte tg2 = (byte)Mathf.RoundToInt(crColor.g * 255f);
+                    byte tb2 = (byte)Mathf.RoundToInt(crColor.b * 255f);
+                    byte ta2 = (byte)Mathf.RoundToInt(crColor.a * 255f);
+                    for (int cIdx = 0; cIdx < colors.Length; cIdx++)
+                    {
+                        colors[cIdx] = new Color32(
+                            (byte)((colors[cIdx].r * tr2) / 255),
+                            (byte)((colors[cIdx].g * tg2) / 255),
+                            (byte)((colors[cIdx].b * tb2) / 255),
+                            (byte)((colors[cIdx].a * ta2) / 255)
+                        );
+                    }
+                }
+
+                if (configDebugLogInterval.Value > 0 && frameCount % 300 == 1)
+                    logger.LogInfo($"[UIGraphic] '{g.gameObject.name}' g.color=({col.r:F2},{col.g:F2},{col.b:F2},{col.a:F2}) crColor=({crColor.r:F2},{crColor.g:F2},{crColor.b:F2}) mat='{sharedMat.name}' tex='{mainTex?.name}'");
+
                 int texHash = mainTex != null ? mainTex.GetInstanceID() : 0;
-                int uiMatId = HashCombine(mat.GetInstanceID(), HashCombine(texHash, colHash));
+                int uiMatId = HashCombine(sharedMat.GetInstanceID(), texHash);
 
                 materialManager.CaptureMaterialTextures(
-                    mat,
+                    sharedMat,
                     uiMatId,
-                    mpbEmissiveColor: col,
+                    mpbEmissiveColor: Color.white,
                     mpbEmissiveIntensity: 1.0f,
                     mpbMainTex: mainTex,
-                    mpbColor: col
+                    mpbColor: Color.white,
+                    forcedAlphaMode: RemixMaterialManager.AlphaMode.Blend
                 );
 
                 int graphicId = g.GetInstanceID();
@@ -1815,6 +1874,608 @@ namespace UnityRemix
                     skinningData = null
                 });
             }
+        }
+
+        /// <summary>
+        /// Captures dynamic line and trail renderers (e.g. Revolver bullet beams, Railcannon beam).
+        /// Bakes camera-facing geometry in world space and applies emissive materials.
+        /// </summary>
+        private void CaptureLineRenderers(FrameState state, int frameCount)
+        {
+            Camera mainCam = cameraHandler?.GetPreferredCamera();
+            Vector3 camPos = mainCam != null ? mainCam.transform.position : Vector3.zero;
+            float maxDist = configUseDistanceCulling.Value ? configMaxRenderDistance.Value : float.MaxValue;
+            float sqrMaxDist = maxDist * maxDist;
+
+            var lines = UnityEngine.Object.FindObjectsOfType<LineRenderer>();
+            if (lines == null || lines.Length == 0) return;
+
+            if (sharedTempLineMesh == null)
+            {
+                sharedTempLineMesh = new Mesh();
+                sharedTempLineMesh.name = "Remix_SharedLineMesh";
+            }
+
+            int slot = 0;
+            for (int i = 0; i < lines.Length && slot < MAX_LINE_SLOTS; i++)
+            {
+                var lr = lines[i];
+                if (lr == null || !lr.enabled || !lr.gameObject.activeInHierarchy)
+                    continue;
+
+                if (lr.positionCount < 2 || lr.widthMultiplier <= 0.0001f)
+                    continue;
+
+                int layer = lr.gameObject.layer;
+                if (layer == 5 || IsLayerDisabled(layer))
+                    continue;
+
+                if (configUseDistanceCulling.Value)
+                {
+                    if (lr.bounds.SqrDistance(camPos) > sqrMaxDist)
+                        continue;
+                }
+
+                sharedTempLineMesh.Clear();
+                try
+                {
+                    if (mainCam != null)
+                        lr.BakeMesh(sharedTempLineMesh, mainCam, false);
+                    else
+                        lr.BakeMesh(sharedTempLineMesh, false);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                int vertCount = sharedTempLineMesh.vertexCount;
+                if (vertCount < 3)
+                    continue;
+
+                var tris = sharedTempLineMesh.triangles;
+                if (tris == null || tris.Length == 0 || tris.Length % 3 != 0)
+                    continue;
+
+                var verts = sharedTempLineMesh.vertices;
+                var uvs = sharedTempLineMesh.uv;
+                if (uvs == null || uvs.Length != vertCount)
+                    uvs = new Vector2[vertCount];
+
+                var norms = sharedTempLineMesh.normals;
+                if (norms == null || norms.Length != vertCount)
+                {
+                    Vector3 norm = mainCam != null ? -mainCam.transform.forward : Vector3.up;
+                    norms = new Vector3[vertCount];
+                    for (int n = 0; n < vertCount; n++) norms[n] = norm;
+                }
+
+                Material mat = lr.sharedMaterial;
+                if (mat == null)
+                {
+                    if (fallbackSpriteMaterial == null)
+                    {
+                        var pShader = Shader.Find("Sprites/Default");
+                        if (pShader != null) fallbackSpriteMaterial = new Material(pShader);
+                    }
+                    mat = fallbackSpriteMaterial;
+                }
+                if (mat == null)
+                    continue;
+
+                Color lrCol = Color.white;
+                try
+                {
+                    var cg = lr.colorGradient;
+                    if (cg != null && cg.colorKeys != null && cg.colorKeys.Length > 0)
+                    {
+                        lrCol = cg.colorKeys[0].color;
+                    }
+                    else if (lr.startColor.a > 0.001f)
+                    {
+                        lrCol = lr.startColor;
+                    }
+                }
+                catch
+                {
+                    if (lr.startColor.a > 0.001f) lrCol = lr.startColor;
+                }
+                if (lrCol.r <= 0.001f && lrCol.g <= 0.001f && lrCol.b <= 0.001f)
+                    lrCol = Color.white;
+
+                var colors = sharedTempLineMesh.colors32;
+                if (colors == null || colors.Length != vertCount)
+                {
+                    colors = new Color32[vertCount];
+                    Color32 c32 = lrCol;
+                    for (int c = 0; c < vertCount; c++) colors[c] = c32;
+                }
+
+                int dynamicMatId = mat.GetInstanceID();
+
+                materialManager.CaptureMaterialTextures(
+                    mat,
+                    dynamicMatId,
+                    mpbEmissiveColor: Color.white,
+                    mpbEmissiveIntensity: 3.0f,
+                    mpbColor: Color.white,
+                    forcedAlphaMode: RemixMaterialManager.AlphaMode.Blend
+                );
+
+                ulong meshHash = (ulong)(uint)lr.GetInstanceID() | 0x4000000000000000UL;
+                slot++;
+
+                if (logger != null && frameCount % 60 == 0)
+                {
+                    logger.LogInfo($"[LineCapture] '{lr.gameObject.name}' id={lr.GetInstanceID()} verts={vertCount} w={lr.widthMultiplier:F2} col=({lrCol.r:F2},{lrCol.g:F2},{lrCol.b:F2})");
+                }
+
+                state.skinned.Add(new SkinnedMeshData
+                {
+                    meshId = lr.GetInstanceID(),
+                    remixMeshHash = meshHash,
+                    materialId = dynamicMatId,
+                    vertices = verts,
+                    normals = norms,
+                    uvs = uvs,
+                    colors = colors,
+                    triangles = tris,
+                    localToWorld = Matrix4x4.identity,
+                    boneTransforms = null,
+                    skinningData = null
+                });
+            }
+        }
+
+        /// <summary>
+        /// Captures dynamic sprite renderers (e.g. Revolver muzzle flash bursts).
+        /// Generates two-sided camera-facing quads and applies high emissive intensity.
+        /// </summary>
+        private void CaptureSpriteRenderers(FrameState state, int frameCount)
+        {
+            Camera mainCam = cameraHandler?.GetPreferredCamera();
+            Vector3 camPos = mainCam != null ? mainCam.transform.position : Vector3.zero;
+            float maxDist = configUseDistanceCulling.Value ? configMaxRenderDistance.Value : float.MaxValue;
+            float sqrMaxDist = maxDist * maxDist;
+
+            var sprites = UnityEngine.Object.FindObjectsOfType<SpriteRenderer>();
+            if (sprites == null || sprites.Length == 0) return;
+
+            int slot = 0;
+            for (int i = 0; i < sprites.Length && slot < MAX_SPRITE_SLOTS; i++)
+            {
+                var sr = sprites[i];
+                if (sr == null || !sr.enabled || !sr.gameObject.activeInHierarchy)
+                    continue;
+
+                // Ignore invisible sprites (e.g. twirlSprite when not spinning, or fading effects)
+                if (sr.color.a <= 0.005f)
+                    continue;
+
+                Sprite s = sr.sprite;
+                if (s == null)
+                    continue;
+
+                int layer = sr.gameObject.layer;
+                if (layer == 5 || IsLayerDisabled(layer))
+                    continue;
+
+                if (configUseDistanceCulling.Value)
+                {
+                    if (sr.bounds.SqrDistance(camPos) > sqrMaxDist)
+                        continue;
+                }
+
+                Vector3[] verts;
+                int[] tris;
+                Vector2[] uvs;
+
+                Vector2[] sVerts = null;
+                ushort[] sTris = null;
+                Vector2[] sUvs = null;
+
+                try
+                {
+                    sVerts = s.vertices;
+                    sTris = s.triangles;
+                    sUvs = s.uv;
+                }
+                catch { }
+
+                if (sVerts != null && sVerts.Length >= 3 && sTris != null && sTris.Length >= 3)
+                {
+                    int vertCount = sVerts.Length;
+                    verts = new Vector3[vertCount];
+                    bool flipX = sr.flipX;
+                    bool flipY = sr.flipY;
+                    for (int v = 0; v < vertCount; v++)
+                    {
+                        float vx = flipX ? -sVerts[v].x : sVerts[v].x;
+                        float vy = flipY ? -sVerts[v].y : sVerts[v].y;
+                        verts[v] = new Vector3(vx, vy, 0f);
+                    }
+
+                    int triCount = sTris.Length;
+                    tris = new int[triCount * 2];
+                    for (int t = 0; t < triCount; t++)
+                        tris[t] = sTris[t];
+                    // Backfaces for two-sided visibility
+                    for (int t = 0; t < triCount; t += 3)
+                    {
+                        tris[triCount + t] = sTris[t + 2];
+                        tris[triCount + t + 1] = sTris[t + 1];
+                        tris[triCount + t + 2] = sTris[t];
+                    }
+
+                    uvs = sUvs != null && sUvs.Length == vertCount ? sUvs : new Vector2[vertCount];
+                }
+                else
+                {
+                    // Fallback to bounding quad
+                    Bounds sb = s.bounds;
+                    Vector3 min = sb.min;
+                    Vector3 max = sb.max;
+                    verts = new Vector3[]
+                    {
+                        new Vector3(min.x, min.y, 0f),
+                        new Vector3(max.x, min.y, 0f),
+                        new Vector3(max.x, max.y, 0f),
+                        new Vector3(min.x, max.y, 0f)
+                    };
+                    uvs = new Vector2[]
+                    {
+                        new Vector2(0f, 0f),
+                        new Vector2(1f, 0f),
+                        new Vector2(1f, 1f),
+                        new Vector2(0f, 1f)
+                    };
+                    tris = new int[]
+                    {
+                        0, 1, 2, 0, 2, 3,
+                        2, 1, 0, 3, 2, 0
+                    };
+                }
+
+                int totalVerts = verts.Length;
+                Vector3 norm = Vector3.back;
+                var norms = new Vector3[totalVerts];
+                for (int n = 0; n < totalVerts; n++) norms[n] = norm;
+
+                Color32 c32 = sr.color;
+                var colors = new Color32[totalVerts];
+                for (int c = 0; c < totalVerts; c++) colors[c] = c32;
+
+                Material mat = sr.sharedMaterial;
+                if (mat == null)
+                {
+                    if (fallbackSpriteMaterial == null)
+                    {
+                        var sprShader = Shader.Find("Sprites/Default");
+                        if (sprShader != null)
+                            fallbackSpriteMaterial = new Material(sprShader);
+                    }
+                    mat = fallbackSpriteMaterial;
+                }
+
+                Texture2D tex = s.texture;
+                Color srColor = sr.color;
+
+                bool isMuzzle = sr.gameObject.name.IndexOf("muzzle", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    (sr.transform.parent != null && sr.transform.parent.name.IndexOf("muzzle", StringComparison.OrdinalIgnoreCase) >= 0);
+                float emIntensity = isMuzzle ? 5.0f : 1.0f;
+
+                if (configDebugLogInterval.Value > 0 && (isMuzzle || sr.gameObject.name.IndexOf("beep", StringComparison.OrdinalIgnoreCase) >= 0 || (sr.transform.parent != null && sr.transform.parent.name.IndexOf("beep", StringComparison.OrdinalIgnoreCase) >= 0)))
+                {
+                    logger.LogInfo($"[SpriteDiag] '{sr.gameObject.name}' parent='{sr.transform.parent?.name}' color=({srColor.r:F3},{srColor.g:F3},{srColor.b:F3},{srColor.a:F3}) emInt={emIntensity} mat='{mat?.name}' tex='{tex?.name}'");
+                }
+
+                // Scale clamping for muzzle flashes: prevent gigantic muzzle flashes (e.g. sawblade launcher 24m-48m)
+                Matrix4x4 l2w = sr.transform.localToWorldMatrix;
+                if (isMuzzle)
+                {
+                    Vector3 lossy = sr.transform.lossyScale;
+                    float maxDim = Mathf.Max(Mathf.Abs(lossy.x), Mathf.Max(Mathf.Abs(lossy.y), Mathf.Abs(lossy.z)));
+                    if (maxDim > 2.5f)
+                    {
+                        float rescale = 2.0f / maxDim;
+                        Vector4 c0 = l2w.GetColumn(0) * rescale;
+                        Vector4 c1 = l2w.GetColumn(1) * rescale;
+                        Vector4 c2 = l2w.GetColumn(2) * rescale;
+                        l2w.SetColumn(0, c0);
+                        l2w.SetColumn(1, c1);
+                        l2w.SetColumn(2, c2);
+                    }
+                }
+
+                int texHash = tex != null ? tex.GetInstanceID() : 0;
+                int srMatId = HashCombine(mat != null ? mat.GetInstanceID() : 0, texHash);
+
+                materialManager.CaptureMaterialTextures(
+                    mat,
+                    srMatId,
+                    mpbEmissiveColor: Color.white,
+                    mpbEmissiveIntensity: emIntensity,
+                    mpbMainTex: tex,
+                    mpbColor: Color.white
+                );
+
+                ulong meshHash = (ulong)(uint)sr.GetInstanceID() | 0x2000000000000000UL;
+                slot++;
+
+                state.skinned.Add(new SkinnedMeshData
+                {
+                    meshId = sr.GetInstanceID(),
+                    remixMeshHash = meshHash,
+                    materialId = srMatId,
+                    vertices = verts,
+                    normals = norms,
+                    uvs = uvs,
+                    colors = colors,
+                    triangles = tris,
+                    localToWorld = l2w,
+                    boneTransforms = null,
+                    skinningData = null
+                });
+            }
+        }
+
+        private static Type _bsmType;
+        private static FieldInfo _bsmCurrentBloodCountField;
+        private static FieldInfo _bsmTotalStainMeshField;
+        private static FieldInfo _bsmStainMatField;
+        private static FieldInfo _bsmUsedComputeField;
+        private static FieldInfo _bsmMeshDirtyField;
+        private static MethodInfo _bsmRebuildMeshMethod;
+        private static bool _bsmReflectionInitialized;
+        private static bool _disabledComputeShadersSet;
+        private static bool _loggedBloodShaderProps;
+        private int _lastLoggedBloodCount = -1;
+
+        /// <summary>
+        /// Captures dynamic blood splatter decal geometry generated by BloodsplatterManager.
+        /// ULTRAKILL draws blood stains on walls and floors into an offscreen CommandBuffer,
+        /// which RTX Remix cannot see directly. When compute shaders are disabled, ULTRAKILL's
+        /// CPU job (GenerateBloodMeshJob) automatically combines all blood decals into totalStainMesh.
+        /// We capture totalStainMesh and submit it directly to RTX Remix in world space!
+        /// </summary>
+        private void CaptureBloodStains(FrameState state, int frameCount)
+        {
+            if (!_bsmReflectionInitialized)
+            {
+                _bsmReflectionInitialized = true;
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    if (_bsmType == null)
+                    {
+                        var t = asm.GetType("BloodsplatterManager");
+                        if (t != null)
+                        {
+                            _bsmType = t;
+                            _bsmCurrentBloodCountField = t.GetField("currentBloodCount", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                            _bsmTotalStainMeshField = t.GetField("totalStainMesh", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                            _bsmStainMatField = t.GetField("stainMat", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                            _bsmUsedComputeField = t.GetField("usedComputeShadersAtStart", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                            _bsmMeshDirtyField = t.GetField("meshDirty", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                            _bsmRebuildMeshMethod = t.GetMethod("RebuildMesh", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                            logger.LogInfo("[BloodCapture] Found BloodsplatterManager type and fields!");
+                        }
+                    }
+                    if (!_disabledComputeShadersSet)
+                    {
+                        var gsType = asm.GetType("SettingsMenu.Components.Pages.GraphicsSettings");
+                        if (gsType != null)
+                        {
+                            var f = gsType.GetField("disabledComputeShaders", BindingFlags.Public | BindingFlags.Static);
+                            if (f != null)
+                            {
+                                f.SetValue(null, true);
+                                _disabledComputeShadersSet = true;
+                                logger.LogInfo("[BloodCapture] Set GraphicsSettings.disabledComputeShaders = true");
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (_bsmType == null) return;
+
+            var bsm = UnityEngine.Object.FindObjectOfType(_bsmType);
+            if (bsm == null) return;
+
+            // Ensure compute shaders are disabled so ULTRAKILL builds totalStainMesh via GenerateBloodMeshJob
+            if (_bsmUsedComputeField != null)
+            {
+                bool usedCompute = (bool)_bsmUsedComputeField.GetValue(bsm);
+                if (usedCompute)
+                {
+                    _bsmUsedComputeField.SetValue(bsm, false);
+                    _bsmMeshDirtyField?.SetValue(bsm, true);
+                    _bsmRebuildMeshMethod?.Invoke(bsm, null);
+                    logger.LogInfo("[BloodCapture] Switched BloodsplatterManager to CPU mesh path (usedComputeShadersAtStart = false)");
+                }
+            }
+
+            int bloodCount = _bsmCurrentBloodCountField != null ? (int)_bsmCurrentBloodCountField.GetValue(bsm) : 0;
+            Mesh stainMesh = _bsmTotalStainMeshField != null ? _bsmTotalStainMeshField.GetValue(bsm) as Mesh : null;
+            Material stainMat = _bsmStainMatField != null ? _bsmStainMatField.GetValue(bsm) as Material : null;
+
+            // Log diagnostics whenever blood count changes or every 300 frames
+            bool shouldLog = (bloodCount != _lastLoggedBloodCount) || (frameCount % 300 == 0);
+            if (shouldLog)
+            {
+                _lastLoggedBloodCount = bloodCount;
+                logger.LogInfo($"[BloodDiag] frame={frameCount} count={bloodCount} meshVerts={(stainMesh != null ? stainMesh.vertexCount : 0)} meshTris={(stainMesh != null ? stainMesh.triangles.Length : 0)} mat='{stainMat?.name}' shader='{stainMat?.shader?.name}' mainTex='{stainMat?.mainTexture?.name}'");
+            }
+
+            // Dump shader properties once to understand the blood material layout
+            if (stainMat != null && !_loggedBloodShaderProps)
+            {
+                _loggedBloodShaderProps = true;
+                var shader = stainMat.shader;
+                if (shader != null)
+                {
+                    var sb = new System.Text.StringBuilder();
+                    sb.Append($"[BloodMatProps] shader='{shader.name}' renderQueue={stainMat.renderQueue}: ");
+                    int pCount = shader.GetPropertyCount();
+                    for (int p = 0; p < pCount; p++)
+                    {
+                        var pName = shader.GetPropertyName(p);
+                        var pType = shader.GetPropertyType(p);
+                        sb.Append($"{pName}({pType}) ");
+                    }
+                    logger.LogInfo(sb.ToString());
+                }
+            }
+
+            if (bloodCount <= 0 || stainMesh == null || stainMesh.vertexCount == 0)
+            {
+                // If blood exists but mesh is empty, trigger rebuild
+                if (bloodCount > 0 && (stainMesh == null || stainMesh.vertexCount == 0))
+                {
+                    _bsmMeshDirtyField?.SetValue(bsm, true);
+                    _bsmRebuildMeshMethod?.Invoke(bsm, null);
+                }
+                return;
+            }
+
+            // Extract mesh data from totalStainMesh
+            Vector3[] rawVerts = stainMesh.vertices;
+            int[] rawTris = stainMesh.triangles;
+            if (rawVerts == null || rawVerts.Length == 0 || rawTris == null || rawTris.Length == 0)
+                return;
+
+            int quadCount = rawVerts.Length / 4;
+            Vector3[] verts = new Vector3[rawVerts.Length];
+            Vector3[] norms = new Vector3[rawVerts.Length];
+            int[] tris = new int[quadCount * 6];
+
+            for (int s = 0; s < quadCount; s++)
+            {
+                int vBase = s * 4;
+                Vector3 v0 = rawVerts[vBase + 0];
+                Vector3 v1 = rawVerts[vBase + 1];
+                Vector3 v2 = rawVerts[vBase + 2];
+                Vector3 v3 = rawVerts[vBase + 3];
+
+                // In GenerateBloodMeshJob, triangle winding (0,1,2) points inward (-norm).
+                // True outward room-facing normal is Cross(v2 - v0, v1 - v0).normalized
+                Vector3 outNorm = Vector3.Cross(v2 - v0, v1 - v0).normalized;
+                if (outNorm.sqrMagnitude < 0.001f)
+                    outNorm = Vector3.up;
+
+                // Push vertices outward along normal (8mm) to clear surface geometry.
+                // 2.5mm was insufficient — RTX Remix uses a slightly different Z-calculation
+                // than Unity, so blood stains were Z-fighting with the floor when camera angle
+                // changed (e.g. between weapon viewmodels with different positions).
+                Vector3 offset = outNorm * 0.008f;
+                verts[vBase + 0] = v0 + offset;
+                verts[vBase + 1] = v1 + offset;
+                verts[vBase + 2] = v2 + offset;
+                verts[vBase + 3] = v3 + offset;
+
+                norms[vBase + 0] = outNorm;
+                norms[vBase + 1] = outNorm;
+                norms[vBase + 2] = outNorm;
+                norms[vBase + 3] = outNorm;
+
+                // Invert winding order so triangles face outward into the room: (0, 2, 1) and (0, 3, 2)
+                int tBase = s * 6;
+                tris[tBase + 0] = vBase + 0;
+                tris[tBase + 1] = vBase + 2;
+                tris[tBase + 2] = vBase + 1;
+                tris[tBase + 3] = vBase + 0;
+                tris[tBase + 4] = vBase + 3;
+                tris[tBase + 5] = vBase + 2;
+            }
+
+            // ULTRAKILL's _SplatterAtlas contains 5 horizontal sub-splatters (160x32 pixels, 5 cells of 32x32).
+            // GenerateBloodMeshJob creates 4 vertices per quad with base UVs (0,0), (1,0), (1,1), (0,1).
+            // In ULTRAKILL's vertex shader, each quad's UV.x is scaled by 0.2 and offset by (index % 5) * 0.2.
+            // We compute the sub-atlas UVs directly here so RTX Remix samples the correct splatter shape!
+            Vector2[] rawUvs = stainMesh.uv;
+            Vector2[] uvs = new Vector2[verts.Length];
+            for (int s = 0; s < quadCount; s++)
+            {
+                int vBase = s * 4;
+                float uOffset = (s % 5) * 0.2f;
+                if (rawUvs != null && rawUvs.Length == verts.Length)
+                {
+                    uvs[vBase + 0] = new Vector2(uOffset + rawUvs[vBase + 0].x * 0.2f, rawUvs[vBase + 0].y);
+                    uvs[vBase + 1] = new Vector2(uOffset + rawUvs[vBase + 1].x * 0.2f, rawUvs[vBase + 1].y);
+                    uvs[vBase + 2] = new Vector2(uOffset + rawUvs[vBase + 2].x * 0.2f, rawUvs[vBase + 2].y);
+                    uvs[vBase + 3] = new Vector2(uOffset + rawUvs[vBase + 3].x * 0.2f, rawUvs[vBase + 3].y);
+                }
+                else
+                {
+                    uvs[vBase + 0] = new Vector2(uOffset, 0f);
+                    uvs[vBase + 1] = new Vector2(uOffset + 0.2f, 0f);
+                    uvs[vBase + 2] = new Vector2(uOffset + 0.2f, 1f);
+                    uvs[vBase + 3] = new Vector2(uOffset, 1f);
+                }
+            }
+
+            // White vertex colors (texture is already tinted blood red)
+            Color32 bloodColor = new Color32(255, 255, 255, 255);
+            Color32[] colors = new Color32[verts.Length];
+            for (int i = 0; i < verts.Length; i++) colors[i] = bloodColor;
+
+            int bloodMatId = stainMat != null ? stainMat.GetInstanceID() : 0x7B100D01;
+            if (stainMat != null)
+            {
+                Texture2D bloodTex = null;
+                if (stainMat.HasProperty("_SplatterAtlas"))
+                    bloodTex = stainMat.GetTexture("_SplatterAtlas") as Texture2D;
+                else if (stainMat.HasProperty("_MainTex"))
+                    bloodTex = stainMat.GetTexture("_MainTex") as Texture2D;
+
+                materialManager.CaptureMaterialTextures(
+                    stainMat,
+                    bloodMatId,
+                    mpbMainTex: bloodTex,
+                    mpbColor: new Color(0.70f, 0.02f, 0.02f, 0.75f),
+                    forcedAlphaMode: RemixMaterialManager.AlphaMode.Blend,
+                    forcedAlphaCutoff: 0.05f
+                );
+            }
+
+            ulong meshHash = 0x7B100D0000000001UL;
+            state.skinned.Add(new SkinnedMeshData
+            {
+                meshId = 0x7B100D01,
+                remixMeshHash = meshHash,
+                materialId = bloodMatId,
+                vertices = verts,
+                normals = norms,
+                uvs = uvs,
+                colors = colors,
+                triangles = tris,
+                localToWorld = Matrix4x4.identity,
+                boneTransforms = null,
+                skinningData = null
+            });
+        }
+
+        /// <summary>
+        /// Captures dynamic non-skinned effects: weapon canvas screens, line/trail beams, sprites, and blood decals.
+        /// Decoupled from CaptureSkinnedMeshes so they never disappear based on weapon model type or enemy skinned mesh counts.
+        /// </summary>
+        public void CaptureDynamicEffects(FrameState state, int frameCount)
+        {
+            // Capture world-space weapon UI screens (e.g. Nailgun ammo counter/heat, Shotgun slider, Rocket Launcher timer)
+            try { CaptureWeaponCanvasScreens(state, frameCount); }
+            catch (Exception ex) { if (configDebugLogInterval.Value > 0 && frameCount % 300 == 0) logger.LogWarning($"[DynamicEffects] CaptureWeaponCanvasScreens error: {ex.Message}"); }
+
+            // Capture dynamic line and trail renderers (e.g. Revolver bullet trail, Railcannon beam)
+            try { CaptureLineRenderers(state, frameCount); }
+            catch (Exception ex) { if (configDebugLogInterval.Value > 0 && frameCount % 300 == 0) logger.LogWarning($"[DynamicEffects] CaptureLineRenderers error: {ex.Message}"); }
+
+            // Capture dynamic sprite renderers (e.g. Revolver muzzle flash)
+            try { CaptureSpriteRenderers(state, frameCount); }
+            catch (Exception ex) { if (configDebugLogInterval.Value > 0 && frameCount % 300 == 0) logger.LogWarning($"[DynamicEffects] CaptureSpriteRenderers error: {ex.Message}"); }
+
+            // Capture blood splatter decals (BloodsplatterManager on floors/walls)
+            try { CaptureBloodStains(state, frameCount); }
+            catch (Exception ex) { if (configDebugLogInterval.Value > 0 && frameCount % 300 == 0) logger.LogWarning($"[DynamicEffects] CaptureBloodStains error: {ex.Message}"); }
         }
         
         /// <summary>

@@ -520,27 +520,30 @@ namespace UnityRemix
             }
             
             // Resize if needed
-            if (poolData.vertexCapacity < vertices.Length)
+            if (poolData.vertexCapacity < vertices.Length || poolData.indexCapacity < triangles.Length)
             {
                 if (poolData.isPinned)
                 {
-                    poolData.vertexHandle.Free();
-                    if (poolData.indexCapacity > 0)
+                    if (poolData.vertexHandle.IsAllocated)
+                        poolData.vertexHandle.Free();
+                    if (poolData.indexHandle.IsAllocated)
                         poolData.indexHandle.Free();
                     poolData.isPinned = false;
                 }
-                poolData.vertices = new RemixAPI.remixapi_HardcodedVertex[vertices.Length];
-                poolData.vertexCapacity = vertices.Length;
-            }
-            
-            if (poolData.indexCapacity < triangles.Length)
-            {
-                if (poolData.isPinned && poolData.indexCapacity > 0)
+                
+                if (poolData.vertexCapacity < vertices.Length)
                 {
-                    poolData.indexHandle.Free();
+                    int newCap = Math.Max(vertices.Length, poolData.vertexCapacity * 2);
+                    poolData.vertices = new RemixAPI.remixapi_HardcodedVertex[newCap];
+                    poolData.vertexCapacity = newCap;
                 }
-                poolData.indices = new uint[triangles.Length];
-                poolData.indexCapacity = triangles.Length;
+                
+                if (poolData.indexCapacity < triangles.Length)
+                {
+                    int newCap = Math.Max(triangles.Length, poolData.indexCapacity * 2);
+                    poolData.indices = new uint[newCap];
+                    poolData.indexCapacity = newCap;
+                }
             }
             
             // Fill data (Y-up to Z-up conversion), applying _MainTex_ST tiling/offset
@@ -944,6 +947,16 @@ namespace UnityRemix
             foreach (ulong id in toRemove)
             {
                 skinnedMeshHandles.Remove(id);
+                if (pinnedMeshPool.TryGetValue(id, out var poolData))
+                {
+                    if (poolData.isPinned)
+                    {
+                        if (poolData.vertexHandle.IsAllocated) poolData.vertexHandle.Free();
+                        if (poolData.indexHandle.IsAllocated) poolData.indexHandle.Free();
+                        poolData.isPinned = false;
+                    }
+                    pinnedMeshPool.Remove(id);
+                }
             }
         }
         

@@ -34,6 +34,11 @@ namespace UnityRemix
         private IntPtr debugTextureHandle = IntPtr.Zero;
         private ulong debugTextureHash;
         private const string DebugTextureHashPath = "0xDEBB0600DEBB0600"; // stable sentinel
+
+        // Solid white texture for materials with no albedo or emissive texture
+        private IntPtr whiteTextureHandle = IntPtr.Zero;
+        private ulong whiteTextureHash = 0xFFFFFFFFFFFFFFFFUL;
+        private const string WhiteTextureHashPath = "0xFFFFFFFFFFFFFFFF";
         
         // DXT5nm Z reconstruction: zLookup[x * 256 + y] = byte Z given X,Y normal components.
         // Precomputed once to avoid per-pixel sqrt during normal map unpacking.
@@ -91,7 +96,7 @@ namespace UnityRemix
         }
         private readonly Queue<PendingTextureUpload> pendingTextureUploads = new Queue<PendingTextureUpload>();
         private readonly HashSet<int> pendingTextureIds = new HashSet<int>();
-        private readonly HashSet<long> pendingTintedKeys = new HashSet<long>();
+        private readonly Dictionary<long, ulong> pendingTintedKeys = new Dictionary<long, ulong>();
         private readonly object pendingTextureLock = new object();
         
         // Alpha handling modes detected from Unity materials
@@ -241,7 +246,15 @@ namespace UnityRemix
         /// <summary>
         /// Capture textures from a Unity material, with optional per-renderer property overrides
         /// </summary>
-        public void CaptureMaterialTextures(Material material, int materialId, Color? mpbEmissiveColor = null, float? mpbEmissiveIntensity = null, Texture2D mpbMainTex = null, Color? mpbColor = null)
+        public void CaptureMaterialTextures(
+            Material material, 
+            int materialId, 
+            Color? mpbEmissiveColor = null, 
+            float? mpbEmissiveIntensity = null, 
+            Texture2D mpbMainTex = null, 
+            Color? mpbColor = null,
+            AlphaMode? forcedAlphaMode = null,
+            float? forcedAlphaCutoff = null)
         {
             if (material == null)
                 return;
@@ -288,9 +301,16 @@ namespace UnityRemix
             };
             
             // Get albedo color if not overridden by MPB
-            if (!mpbColor.HasValue && material.HasProperty("_Color"))
+            if (!mpbColor.HasValue)
             {
-                matData.albedoColor = material.GetColor("_Color");
+                if (material.HasProperty("_Color"))
+                {
+                    matData.albedoColor = material.GetColor("_Color");
+                }
+                else if (material.HasProperty("_TintColor"))
+                {
+                    matData.albedoColor = material.GetColor("_TintColor");
+                }
             }
             
             // Capture texture tiling/offset
@@ -305,8 +325,12 @@ namespace UnityRemix
             
             // Detect alpha mode from shader keywords, _Mode property, and render queue
             var (detectedMode, detectionReason) = DetectAlphaModeWithReason(material);
-            matData.alphaMode = detectedMode;
-            if (material.HasProperty("_Cutoff"))
+            matData.alphaMode = forcedAlphaMode ?? detectedMode;
+            if (forcedAlphaCutoff.HasValue)
+            {
+                matData.alphaCutoff = forcedAlphaCutoff.Value;
+            }
+            else if (material.HasProperty("_Cutoff"))
             {
                 matData.alphaCutoff = material.GetFloat("_Cutoff");
             }
@@ -373,7 +397,7 @@ namespace UnityRemix
             
             // Fallback: no albedo texture but material has a color — create a 1x1 solid-color texture
             // so Remix renders the surface with the correct color instead of the debug checkerboard.
-            if (matData.albedoHandle == IntPtr.Zero && (mpbColor.HasValue || material.HasProperty("_Color")))
+            if (matData.albedoHandle == IntPtr.Zero && (mpbColor.HasValue || material.HasProperty("_Color") || material.HasProperty("_TintColor")))
             {
                 matData.albedoHandle = GetOrCreateSolidColorTexture(matData.albedoColor);
                 if (matData.albedoHandle != IntPtr.Zero)
@@ -437,12 +461,25 @@ namespace UnityRemix
                 }
                 
                 // ULTRAKILL/custom shader path: _EmissiveColor, _EmissiveTex, _EmissiveIntensity, or MPB override
-                bool hasMpbOverride = mpbEmissiveColor.HasValue || mpbColor.HasValue;
+                bool isUiShader = shaderName.IndexOf("UI/", StringComparison.OrdinalIgnoreCase) >= 0
+                    || shaderName.IndexOf("GUI/", StringComparison.OrdinalIgnoreCase) >= 0
+                    || shaderName.IndexOf("TextMeshPro", StringComparison.OrdinalIgnoreCase) >= 0
+                    || shaderName.Equals("Alpha Blended", StringComparison.OrdinalIgnoreCase);
+
+                bool isEffectOrUiShader = isUiShader
+                    || shaderName.IndexOf("Sprite", StringComparison.OrdinalIgnoreCase) >= 0
+                    || shaderName.IndexOf("Particle", StringComparison.OrdinalIgnoreCase) >= 0
+                    || shaderName.IndexOf("Additive", StringComparison.OrdinalIgnoreCase) >= 0
+                    || shaderName.IndexOf("Unlit", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                bool hasMpbOverride = mpbEmissiveColor.HasValue || (isEffectOrUiShader && mpbColor.HasValue);
                 if (!hasEmission && (material.HasProperty("_EmissiveColor") || hasMpbOverride))
                 {
-                    bool emissiveToggle = true;
+                    bool emissiveToggle = false;
                     if (material.HasProperty("EMISSIVE"))
                         emissiveToggle = material.GetFloat("EMISSIVE") > 0.5f;
+                    else if (material.IsKeywordEnabled("_EMISSION") || material.IsKeywordEnabled("EMISSIVE"))
+                        emissiveToggle = true;
                     
                     // A dedicated _EmissiveTex overrides the toggle (artist assigned a glow map)
                     bool hasEmissiveTex = false;
@@ -452,7 +489,7 @@ namespace UnityRemix
                     if (emissiveToggle || hasEmissiveTex || hasMpbOverride)
                     {
                         Color defaultCol = material.HasProperty("_EmissiveColor") ? material.GetColor("_EmissiveColor") : Color.black;
-                        matData.emissiveColor = mpbEmissiveColor ?? (mpbColor.HasValue ? mpbColor.Value : defaultCol);
+                        matData.emissiveColor = mpbEmissiveColor ?? (isEffectOrUiShader && mpbColor.HasValue ? mpbColor.Value : defaultCol);
                         
                         if (mpbEmissiveIntensity.HasValue)
                             matData.emissiveIntensity = mpbEmissiveIntensity.Value;
@@ -461,7 +498,7 @@ namespace UnityRemix
                         else
                         {
                             float maxCh = Mathf.Max(matData.emissiveColor.r, Mathf.Max(matData.emissiveColor.g, matData.emissiveColor.b));
-                            matData.emissiveIntensity = maxCh > 0f ? maxCh : 1.0f;
+                            matData.emissiveIntensity = maxCh > 0f ? 1.0f : 0f;
                         }
                         
                         // Upload _EmissiveTex if present, pre-tinted by emission color
@@ -476,16 +513,25 @@ namespace UnityRemix
                             }
                         }
                         
-                        // _UseAlbedoAsEmissive when toggle is on or when MPB display override is present
-                        if ((emissiveToggle || hasMpbOverride) && matData.emissiveHandle == IntPtr.Zero
-                            && ((material.HasProperty("_UseAlbedoAsEmissive") && material.GetFloat("_UseAlbedoAsEmissive") > 0.5f) || hasMpbOverride)
-                            && matData.albedoHandle != IntPtr.Zero)
+                        // _UseAlbedoAsEmissive:
+                        // ONLY allowed for UI/effect shaders or if the material explicitly has _UseAlbedoAsEmissive > 0.5f.
+                        // NEVER upload 3D models (enemies, weapons) as emissive maps from their diffuse albedo!
+                        bool allowAlbedoAsEmissive = (material.HasProperty("_UseAlbedoAsEmissive") && material.GetFloat("_UseAlbedoAsEmissive") > 0.5f)
+                            || (isEffectOrUiShader && hasMpbOverride);
+
+                        if (allowAlbedoAsEmissive && matData.emissiveHandle == IntPtr.Zero && matData.albedoHandle != IntPtr.Zero)
                         {
-                            if (albedoTex != null)
+                            // If albedo was already tinted to the same color (e.g. from mpbColor), reuse it directly
+                            if (mpbColor.HasValue && mpbEmissiveColor.HasValue && mpbColor.Value == mpbEmissiveColor.Value)
+                            {
+                                matData.emissiveHandle = matData.albedoHandle;
+                                matData.emissiveTextureHash = matData.albedoTextureHash;
+                            }
+                            else if (albedoTex != null)
                             {
                                 var (emHandle, emHash) = UploadTintedEmissiveTexture(albedoTex, matData.emissiveColor);
-                                matData.emissiveHandle = emHandle;
-                                matData.emissiveTextureHash = emHash;
+                                matData.emissiveHandle = emHandle != IntPtr.Zero ? emHandle : matData.albedoHandle;
+                                matData.emissiveTextureHash = emHash != 0 ? emHash : matData.albedoTextureHash;
                             }
                             else
                             {
@@ -494,7 +540,7 @@ namespace UnityRemix
                             }
                         }
                         
-                        hasEmission = matData.emissiveIntensity > 0f && matData.emissiveHandle != IntPtr.Zero;
+                        hasEmission = matData.emissiveIntensity > 0f && (matData.emissiveHandle != IntPtr.Zero || hasMpbOverride);
                     }
                 }
                 
@@ -579,9 +625,9 @@ namespace UnityRemix
                 // intensity so text appears clearly self-lit in the path-traced scene.
                 if (!hasEmission && shaderName.Contains("TextMeshPro/Distance Field"))
                 {
-                    Color faceColor = material.HasProperty("_FaceColor")
+                    Color faceColor = mpbColor ?? (material.HasProperty("_FaceColor")
                         ? material.GetColor("_FaceColor")
-                        : Color.white;
+                        : Color.white);
                     float maxCh = Mathf.Max(faceColor.r, Mathf.Max(faceColor.g, faceColor.b));
                     if (maxCh > 0f && albedoTex != null)
                     {
@@ -945,8 +991,8 @@ namespace UnityRemix
             {
                 if (tintedTextureCache.TryGetValue(cacheKey, out var cached))
                     return cached;
-                if (pendingTintedKeys.Contains(cacheKey))
-                    return (IntPtr.Zero, 0); // Will be available after render thread processes it
+                if (pendingTintedKeys.TryGetValue(cacheKey, out ulong pendingHash))
+                    return (new IntPtr((long)pendingHash), pendingHash);
             }
             
             try
@@ -977,13 +1023,38 @@ namespace UnityRemix
                 byte tG = (byte)(tintG * 255f);
                 byte tB = (byte)(tintB * 255f);
                 
+                bool isBlood = (!string.IsNullOrEmpty(tex.name) && (tex.name.IndexOf("blood", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                                    tex.name.IndexOf("splatter", StringComparison.OrdinalIgnoreCase) >= 0));
+                
                 byte[] pixelData = new byte[pixels.Length * 4];
                 for (int i = 0; i < pixels.Length; i++)
                 {
-                    pixelData[i * 4 + 0] = (byte)((pixels[i].r * tR) / 255);
-                    pixelData[i * 4 + 1] = (byte)((pixels[i].g * tG) / 255);
-                    pixelData[i * 4 + 2] = (byte)((pixels[i].b * tB) / 255);
-                    pixelData[i * 4 + 3] = pixels[i].a;
+                    if (isBlood)
+                    {
+                        // Blood splatter atlases store splatter alpha in A and packed shader data in RGB (where R drops to 0 in center).
+                        // Set full vibrant blood color for all splatter pixels to eliminate dark/black centers.
+                        if (pixels[i].a > 0)
+                        {
+                            pixelData[i * 4 + 0] = tR;
+                            pixelData[i * 4 + 1] = tG;
+                            pixelData[i * 4 + 2] = tB;
+                            pixelData[i * 4 + 3] = pixels[i].a;
+                        }
+                        else
+                        {
+                            pixelData[i * 4 + 0] = 0;
+                            pixelData[i * 4 + 1] = 0;
+                            pixelData[i * 4 + 2] = 0;
+                            pixelData[i * 4 + 3] = 0;
+                        }
+                    }
+                    else
+                    {
+                        pixelData[i * 4 + 0] = (byte)((pixels[i].r * tR) / 255);
+                        pixelData[i * 4 + 1] = (byte)((pixels[i].g * tG) / 255);
+                        pixelData[i * 4 + 2] = (byte)((pixels[i].b * tB) / 255);
+                        pixelData[i * 4 + 3] = pixels[i].a;
+                    }
                 }
                 
                 ulong hash = XXHash64.ComputeHash(pixelData, 0, pixelData.Length);
@@ -1006,7 +1077,7 @@ namespace UnityRemix
                         mipLevels = 1,
                         format = RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM
                     });
-                    pendingTintedKeys.Add(cacheKey);
+                    pendingTintedKeys[cacheKey] = hash;
                 }
                 
                 return (new IntPtr((long)hash), hash);
@@ -1040,8 +1111,8 @@ namespace UnityRemix
             {
                 if (tintedTextureCache.TryGetValue(cacheKey, out var cached))
                     return cached;
-                if (pendingTintedKeys.Contains(cacheKey))
-                    return (IntPtr.Zero, 0);
+                if (pendingTintedKeys.TryGetValue(cacheKey, out ulong pendingHash))
+                    return (new IntPtr((long)pendingHash), pendingHash);
             }
             
             try
@@ -1099,7 +1170,7 @@ namespace UnityRemix
                         mipLevels = 1,
                         format = RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM
                     });
-                    pendingTintedKeys.Add(cacheKey);
+                    pendingTintedKeys[cacheKey] = hash;
                 }
                 
                 return (new IntPtr((long)hash), hash);
@@ -1156,8 +1227,10 @@ namespace UnityRemix
             hash ^= (ulong)BitConverter.DoubleToInt64Bits(matData.emissiveColor.r);
             hash *= 1099511628211UL;
             hash ^= (ulong)BitConverter.DoubleToInt64Bits(matData.emissiveColor.g);
-            hash *= 1099511628211UL;
             hash ^= (ulong)BitConverter.DoubleToInt64Bits(matData.emissiveColor.b);
+            hash *= 1099511628211UL;
+            // Incorporate alpha mode so cutout materials never collide with opaque materials
+            hash ^= (ulong)matData.alphaMode;
             hash *= 1099511628211UL;
             
             if (hash == 0) hash = 1;
@@ -1336,6 +1409,14 @@ namespace UnityRemix
         /// </summary>
         private static (AlphaMode mode, string reason) DetectAlphaModeWithReason(Material material)
         {
+            // 0. Dedicated bloodstain shaders and materials (ULTRAKILL procedural instanced decals)
+            string sName = material.shader != null ? material.shader.name : string.Empty;
+            if (sName.IndexOf("bloodstain", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                material.name.IndexOf("bloodstain", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return (AlphaMode.Cutout, "bloodstain");
+            }
+
             // 1. Shader keywords (most reliable, works across Standard/URP/HDRP/custom)
             if (material.IsKeywordEnabled("_ALPHATEST_ON"))
                 return (AlphaMode.Cutout, "keyword:_ALPHATEST_ON");
@@ -1390,19 +1471,42 @@ namespace UnityRemix
                 }
                 logger.LogInfo($"[HashDebug-Material] materialId={materialId} rawName='{matData.materialName}' cleanedName='{cleanMatName}' emColor=({matData.emissiveColor.r:F3},{matData.emissiveColor.g:F3},{matData.emissiveColor.b:F3}) matHash=0x{matHash:X16}");
                 
-                // Use debug placeholder for materials with no albedo texture
+                // Use clean white texture for materials with no albedo texture
                 if (albedoPath == null)
                 {
-                    EnsureDebugTexture();
-                    if (debugTextureHandle != IntPtr.Zero)
+                    EnsureWhiteTexture();
+                    if (whiteTextureHandle != IntPtr.Zero)
                     {
-                        albedoPath = DebugTextureHashPath;
-                        lock (placeholderMaterialNames)
-                            placeholderMaterialNames.Add(matData.materialName ?? $"mat_{materialId}");
+                        albedoPath = WhiteTextureHashPath;
                     }
                 }
 
                 string emissivePath = GetTexturePathFromHandle(matData.emissiveHandle);
+                if (emissivePath == null && matData.emissiveIntensity > 0f)
+                {
+                    // If we have an emissive color that isn't white, create a solid color texture with that color.
+                    // Remix's MDL shader ignores emissiveColorConstant when an emissive texture is set, so
+                    // WhiteTextureHashPath would force non-white emissives (e.g. green/red beeper) to glow pure white.
+                    float emMax = Mathf.Max(matData.emissiveColor.r, Mathf.Max(matData.emissiveColor.g, matData.emissiveColor.b));
+                    if (emMax > 0.01f && (Mathf.Abs(matData.emissiveColor.r - emMax) > 0.05f || Mathf.Abs(matData.emissiveColor.g - emMax) > 0.05f || Mathf.Abs(matData.emissiveColor.b - emMax) > 0.05f))
+                    {
+                        Color normColor = new Color(matData.emissiveColor.r / emMax, matData.emissiveColor.g / emMax, matData.emissiveColor.b / emMax, 1f);
+                        IntPtr solidHandle = GetOrCreateSolidColorTexture(normColor);
+                        if (solidHandle != IntPtr.Zero)
+                        {
+                            emissivePath = GetTexturePathFromHandle(solidHandle);
+                        }
+                    }
+                    if (emissivePath == null)
+                    {
+                        EnsureWhiteTexture();
+                        if (whiteTextureHandle != IntPtr.Zero)
+                        {
+                            emissivePath = WhiteTextureHashPath;
+                        }
+                    }
+                }
+
                 if (verboseTextureLogging.Value)
                     logger.LogInfo($"[MaterialCreate] '{matData.materialName}': albedo={albedoPath ?? "none"}, normal={normalPath ?? "none"}, emissive={emissivePath ?? "none"}, emColor=({matData.emissiveColor.r:F3},{matData.emissiveColor.g:F3},{matData.emissiveColor.b:F3}), emIntensity={matData.emissiveIntensity:F3}, alphaMode={matData.alphaMode}");
                 
@@ -1418,7 +1522,7 @@ namespace UnityRemix
                     albedoConstant_y = matData.albedoColor.g,
                     albedoConstant_z = matData.albedoColor.b,
                     opacityConstant = matData.albedoColor.a,
-                    roughnessConstant = 0.5f,
+                    roughnessConstant = (!string.IsNullOrEmpty(matData.materialName) && matData.materialName.IndexOf("blood", StringComparison.OrdinalIgnoreCase) >= 0) ? 0.15f : 0.5f,
                     metallicConstant = 0.0f,
                     thinFilmThickness_hasvalue = 0,
                     thinFilmThickness_value = 0.0f,
@@ -1449,6 +1553,12 @@ namespace UnityRemix
                         // blended surface; kAlpha (0) only contributes indirect light
                         // bounces which makes blended geometry invisible in direct view.
                         opaqueExt.blendType_value = 1;
+                        // Discard background pixels with alpha below cutoff while blending valid blood pixels
+                        if (matData.alphaCutoff > 0f)
+                        {
+                            opaqueExt.alphaTestType = 6;
+                            opaqueExt.alphaReferenceValue = (byte)(Mathf.Clamp01(matData.alphaCutoff) * 255f);
+                        }
                         break;
                 }
                 
@@ -1659,6 +1769,63 @@ namespace UnityRemix
                 else
                 {
                     logger.LogWarning($"Failed to create debug texture: {result}");
+                }
+            }
+            finally
+            {
+                pinned.Free();
+            }
+        }
+
+        private void EnsureWhiteTexture()
+        {
+            if (whiteTextureHandle != IntPtr.Zero)
+                return;
+            CreateWhiteTexture();
+        }
+
+        private void CreateWhiteTexture()
+        {
+            if (createTextureFunc == null)
+                return;
+
+            const int size = 4;
+            byte[] pixels = new byte[size * size * 4];
+            for (int i = 0; i < pixels.Length; i++)
+                pixels[i] = 255;
+
+            whiteTextureHash = 0xFFFFFFFFFFFFFFFFUL;
+
+            GCHandle pinned = GCHandle.Alloc(pixels, GCHandleType.Pinned);
+            try
+            {
+                var info = new RemixAPI.remixapi_TextureInfo
+                {
+                    sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_TEXTURE_INFO,
+                    pNext = IntPtr.Zero,
+                    hash = whiteTextureHash,
+                    width = size,
+                    height = size,
+                    depth = 1,
+                    mipLevels = 1,
+                    format = RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM,
+                    data = pinned.AddrOfPinnedObject(),
+                    dataSize = (ulong)pixels.Length
+                };
+
+                RemixAPI.remixapi_ErrorCode result;
+                lock (apiLock)
+                {
+                    result = createTextureFunc(ref info, out whiteTextureHandle);
+                }
+
+                if (result == RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
+                {
+                    logger.LogInfo($"Created solid white texture (hash: 0x{whiteTextureHash:X16})");
+                }
+                else
+                {
+                    logger.LogWarning($"Failed to create solid white texture: {result}");
                 }
             }
             finally

@@ -6,6 +6,7 @@ namespace UnityRemix
     /// <summary>
     /// Persistent behaviour that survives scene changes and handles LateUpdate for skinned mesh capture
     /// </summary>
+    [DefaultExecutionOrder(int.MaxValue)]
     public class RemixPersistentBehaviour : MonoBehaviour
     {
         private UnityRemixPlugin plugin;
