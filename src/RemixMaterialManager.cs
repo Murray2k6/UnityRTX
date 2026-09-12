@@ -1414,7 +1414,7 @@ namespace UnityRemix
             if (sName.IndexOf("bloodstain", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 material.name.IndexOf("bloodstain", StringComparison.OrdinalIgnoreCase) >= 0)
             {
-                return (AlphaMode.Cutout, "bloodstain");
+                return (AlphaMode.Blend, "bloodstain");
             }
 
             // 1. Shader keywords (most reliable, works across Standard/URP/HDRP/custom)

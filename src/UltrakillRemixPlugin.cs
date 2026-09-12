@@ -126,9 +126,9 @@ namespace UnityRemix
             configUseVisibilityCulling = Config.Bind("Rendering", "UseVisibilityCulling", false,
                 "Use Unity's renderer.isVisible check to filter out invisible renderers. May cause visual issues in some games - disable if you see missing geometry.");
             
-            configRendererCacheDuration = Config.Bind("Performance", "RendererCacheDuration", 300,
+            configRendererCacheDuration = Config.Bind("Performance", "RendererCacheDuration", 60,
                 new ConfigDescription("Number of frames to cache renderer list before refreshing.",
-                    new AcceptableValueRange<int>(60, 3600)));
+                    new AcceptableValueRange<int>(10, 3600)));
             
             configDebugLogInterval = Config.Bind("Debug", "DetailedLogInterval", 0,
                 new ConfigDescription("Number of frames between detailed diagnostic logs (skinned dumps, prune reasons, mesh failures). 0 = disabled.",
