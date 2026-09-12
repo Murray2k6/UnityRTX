@@ -841,6 +841,10 @@ namespace UnityRemix
             {
                 if (renderer == null || !renderer.enabled || !renderer.gameObject.activeInHierarchy)
                     continue;
+
+                var lossy = renderer.transform.lossyScale;
+                if (lossy.sqrMagnitude < 0.0001f)
+                    continue;
                 
                 if (IsLayerDisabled(renderer.gameObject.layer))
                     continue;
@@ -1165,6 +1169,14 @@ namespace UnityRemix
                 if (entry.renderer.enabled && entry.renderer.gameObject.activeInHierarchy)
                     continue;
 
+                var lossy = entry.renderer.transform.lossyScale;
+                if (lossy.sqrMagnitude < 0.0001f)
+                {
+                    if (keysToRemove == null) keysToRemove = new List<int>();
+                    keysToRemove.Add(kv.Key);
+                    continue;
+                }
+
                 var meshFilter = entry.renderer.GetComponent<MeshFilter>();
                 var mesh = meshFilter != null ? meshFilter.sharedMesh : null;
                 if (ShouldPreferSceneScan(entry.renderer, mesh))
@@ -1360,6 +1372,15 @@ namespace UnityRemix
                         int staleId = HashUtils.GetHierarchyHashInt(skinned.transform);
                         persistentSkinnedData.Remove(staleId);
                     }
+                    skipNull++;
+                    continue;
+                }
+
+                var scale = skinned.transform.lossyScale;
+                if (scale.sqrMagnitude < 0.0001f)
+                {
+                    int staleId = HashUtils.GetHierarchyHashInt(skinned.transform);
+                    persistentSkinnedData.Remove(staleId);
                     skipNull++;
                     continue;
                 }

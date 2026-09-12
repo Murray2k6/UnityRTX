@@ -346,6 +346,7 @@ namespace UnityRemix
                 meshConverter,
                 materialManager,
                 remixApiLock,
+                frameCapture.IsLayerDisabled,
                 configSceneScanActiveOnly.Value
             );
             
@@ -633,7 +634,10 @@ namespace UnityRemix
                 case "CaptureTextures": configCaptureTextures.Value = value; break;
                 case "CaptureMaterials": configCaptureMaterials.Value = value; break;
                 case "EnableSceneScan": configEnableSceneScan.Value = value; break;
-                case "ActiveRenderersOnly": configSceneScanActiveOnly.Value = value; break;
+                case "ActiveRenderersOnly":
+                    configSceneScanActiveOnly.Value = value;
+                    if (sceneMeshScanner != null) sceneMeshScanner.ScanActiveOnly = value;
+                    break;
                 case "PersistDisabledRenderers": configPersistDisabledRenderers.Value = value; break;
             }
         }
