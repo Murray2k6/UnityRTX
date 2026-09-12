@@ -76,9 +76,12 @@ namespace UnityRemix
             logger?.LogInfo($"[RemixFramebufferPresenter] Initialized (SingleWindow: {singleWindow.Value}, Method: {singleWindowMethod.Value}, SuppressInEngine: {disableInEngineRendering.Value}, AutoDetectUI: {autoDetectUI.Value})");
         }
 
+        private int lastCameraCount = -1;
+
         public void OnSceneLoaded(UnityEngine.SceneManagement.Scene scene)
         {
-            sceneRefreshCounter = 5; // Re-evaluate suppression on the next 5 frames to catch async objects
+            sceneRefreshCounter = 10; // Re-evaluate suppression over the next 10 frames to catch async objects
+            lastCameraCount = -1;
         }
 
         public void Update(int frameCount)
@@ -88,9 +91,13 @@ namespace UnityRemix
             bool isSingle = configSingleWindow.Value;
             bool shouldSuppress = isSingle && configDisableInEngineRendering.Value;
 
-            if (shouldSuppress != inEngineRenderingSuppressed || sceneRefreshCounter > 0)
+            int currentCameraCount = Camera.allCamerasCount;
+            bool cameraCountChanged = currentCameraCount != lastCameraCount;
+
+            if (shouldSuppress != inEngineRenderingSuppressed || (sceneRefreshCounter > 0 && cameraCountChanged))
             {
                 if (sceneRefreshCounter > 0) sceneRefreshCounter--;
+                lastCameraCount = currentCameraCount;
 
                 if (shouldSuppress)
                     ApplyInEngineRenderingSuppression();

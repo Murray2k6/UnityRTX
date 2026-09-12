@@ -53,9 +53,18 @@ namespace UnityRemix
         private const uint SWP_NOACTIVATE = 0x0010;
         private const uint SWP_SHOWWINDOW = 0x0040;
 
+        private const int SW_HIDE = 0;
+        private const int SW_SHOWNOACTIVATE = 4;
+
         private const byte AC_SRC_OVER = 0x00;
         private const byte AC_SRC_ALPHA = 0x01;
         private const uint ULW_ALPHA = 0x00000002;
+
+        private bool isOverlayVisible = true;
+        private bool hasLoggedOpaqueWarning = false;
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
         [StructLayout(LayoutKind.Sequential)]
         private struct POINT
@@ -248,19 +257,25 @@ namespace UnityRemix
                     };
                 }
 
-                cam.targetTexture = uiRenderTexture;
+                var targetClear = isFirst ? CameraClearFlags.SolidColor : CameraClearFlags.Depth;
+                var targetBg = new Color(0, 0, 0, 0);
 
+                // Attach or update hook to ensure targetTexture and clear flags persist even if game hooks onPreRender
+                var hook = cam.GetComponent<RemixUICameraHook>();
+                if (hook == null)
+                {
+                    hook = cam.gameObject.AddComponent<RemixUICameraHook>();
+                }
+                hook.targetTexture = uiRenderTexture;
+                hook.clearFlags = targetClear;
+                hook.backgroundColor = targetBg;
+
+                cam.targetTexture = uiRenderTexture;
+                cam.clearFlags = targetClear;
                 if (isFirst)
                 {
-                    // First UI camera clears the RenderTexture to completely transparent black
-                    cam.clearFlags = CameraClearFlags.SolidColor;
-                    cam.backgroundColor = new Color(0, 0, 0, 0);
+                    cam.backgroundColor = targetBg;
                     isFirst = false;
-                }
-                else
-                {
-                    // Subsequent UI cameras only clear depth so they composite together
-                    cam.clearFlags = CameraClearFlags.Depth;
                 }
             }
 
@@ -274,6 +289,17 @@ namespace UnityRemix
         public void UpdateOverlay()
         {
             if (overlayWindow == IntPtr.Zero || uiRenderTexture == null) return;
+
+            // When Remix Alt+X menu is open, hide overlay window so user has 100% unobstructed control
+            if (RemixWindowManager.IsRemixUIOpen)
+            {
+                if (isOverlayVisible)
+                {
+                    ShowWindow(overlayWindow, SW_HIDE);
+                    isOverlayVisible = false;
+                }
+                return;
+            }
 
             SyncWindowBounds();
 
@@ -301,13 +327,16 @@ namespace UnityRemix
             var pixelData = readbackTexture.GetRawTextureData<byte>();
             pixelData.CopyTo(rawPixels);
 
+            int opaquePixelCount = 0;
+            int nonZeroPixelCount = 0;
+            int totalPixels = width * height;
+
             // Convert RGBA to BGRA with premultiplied alpha for UpdateLayeredWindow
             unsafe
             {
                 fixed (byte* pSrc = rawPixels)
                 {
                     byte* pDst = (byte*)overlayBits;
-                    int totalPixels = width * height;
                     byte* s = pSrc;
                     byte* d = pDst;
 
@@ -317,6 +346,9 @@ namespace UnityRemix
                         byte g = s[1];
                         byte b = s[2];
                         byte a = s[3];
+
+                        if (a > 200) opaquePixelCount++;
+                        if (a > 0 || r > 0 || g > 0 || b > 0) nonZeroPixelCount++;
 
                         if (a == 255)
                         {
@@ -341,6 +373,40 @@ namespace UnityRemix
                         d += 4;
                     }
                 }
+            }
+
+            // CRITICAL WATCHDOG: If > 85% of pixels are opaque, this is NOT a transparent UI overlay!
+            // It is an opaque full-screen camera clear or full-screen post-processing blit.
+            // Drawing this on the layered window would turn the entire screen black or opaque!
+            float opaqueRatio = (float)opaquePixelCount / totalPixels;
+            if (opaqueRatio > 0.85f)
+            {
+                if (!hasLoggedOpaqueWarning)
+                {
+                    logger?.LogWarning($"[RemixUIOverlay] UI camera output is {opaqueRatio * 100:F1}% opaque! Suppressing overlay to prevent black screen.");
+                    hasLoggedOpaqueWarning = true;
+                }
+                if (isOverlayVisible)
+                {
+                    ShowWindow(overlayWindow, SW_HIDE);
+                    isOverlayVisible = false;
+                }
+                return;
+            }
+            else
+            {
+                hasLoggedOpaqueWarning = false;
+            }
+
+            // If completely empty (no UI pixels rendered at all), hide overlay
+            if (nonZeroPixelCount == 0)
+            {
+                if (isOverlayVisible)
+                {
+                    ShowWindow(overlayWindow, SW_HIDE);
+                    isOverlayVisible = false;
+                }
+                return;
             }
 
             // Update Win32 Layered Window
@@ -368,6 +434,12 @@ namespace UnityRemix
                 ref blend,
                 ULW_ALPHA
             );
+
+            if (!isOverlayVisible)
+            {
+                ShowWindow(overlayWindow, SW_SHOWNOACTIVATE);
+                isOverlayVisible = true;
+            }
         }
 
         public void SyncWindowBounds()
@@ -463,6 +535,9 @@ namespace UnityRemix
                 var cam = kvp.Key;
                 if (cam != null)
                 {
+                    var hook = cam.GetComponent<RemixUICameraHook>();
+                    if (hook != null) UnityEngine.Object.Destroy(hook);
+
                     cam.targetTexture = kvp.Value.targetTexture;
                     cam.clearFlags = kvp.Value.clearFlags;
                     cam.backgroundColor = kvp.Value.backgroundColor;
@@ -495,6 +570,35 @@ namespace UnityRemix
             {
                 DestroyWindow(overlayWindow);
                 overlayWindow = IntPtr.Zero;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Attached to active UI Cameras to ensure their render target is locked to the UI RenderTexture
+    /// with transparent solid clear, executing in MonoBehaviour.OnPreRender right before camera culling.
+    /// </summary>
+    public class RemixUICameraHook : MonoBehaviour
+    {
+        public RenderTexture targetTexture;
+        public CameraClearFlags clearFlags = CameraClearFlags.Depth;
+        public Color backgroundColor = new Color(0, 0, 0, 0);
+
+        private Camera cam;
+
+        void Awake()
+        {
+            cam = GetComponent<Camera>();
+        }
+
+        void OnPreRender()
+        {
+            if (cam == null) cam = GetComponent<Camera>();
+            if (cam != null && targetTexture != null)
+            {
+                cam.targetTexture = targetTexture;
+                cam.clearFlags = clearFlags;
+                cam.backgroundColor = backgroundColor;
             }
         }
     }

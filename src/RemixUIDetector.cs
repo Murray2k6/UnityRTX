@@ -24,14 +24,60 @@ namespace UnityRemix
         private readonly Dictionary<Canvas, RenderMode> originalCanvasRenderModes = new Dictionary<Canvas, RenderMode>();
         private readonly Dictionary<Canvas, Camera> originalCanvasCameras = new Dictionary<Canvas, Camera>();
 
-        // Common UI keywords in camera names across Unity games
+        // UI keywords: checked via token matching or substring for longer keywords
         private static readonly string[] UIKeywords = new string[]
         {
             "ui", "hud", "canvas", "menu", "gui", "overlay", "interface",
-            "virtual", "crosshair", "reticle", "cursor", "viewmodel", "gun",
-            "weapon", "text", "subtitles", "scoreboard", "minimap", "radar",
-            "dialogue", "chat", "fps", "debug"
+            "crosshair", "reticle", "cursor", "viewmodel", "gun", "weapon",
+            "text", "subtitles", "scoreboard", "minimap", "radar", "dialogue", "chat"
         };
+
+        // Explicitly excluded camera name patterns (post-processing, blit, utility, physics cameras)
+        private static readonly string[] ExcludedKeywords = new string[]
+        {
+            "virtual", "postprocess", "post-process", "blit", "effect",
+            "final", "downscale", "pixel", "shadow", "depth", "normal",
+            "skybox", "reflection", "portal", "water"
+        };
+
+        public static bool MatchesExcludedKeyword(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            string lower = name.ToLowerInvariant();
+            for (int i = 0; i < ExcludedKeywords.Length; i++)
+            {
+                if (lower.Contains(ExcludedKeywords[i])) return true;
+            }
+            return false;
+        }
+
+        public static bool MatchesUIKeyword(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            string lower = name.ToLowerInvariant();
+
+            if (MatchesExcludedKeyword(name)) return false;
+
+            char[] delims = new char[] { ' ', '_', '-', '/', '.', ':', '(', ')' };
+            string[] tokens = lower.Split(delims, StringSplitOptions.RemoveEmptyEntries);
+
+            for (int i = 0; i < tokens.Length; i++)
+            {
+                string token = tokens[i];
+                for (int j = 0; j < UIKeywords.Length; j++)
+                {
+                    if (token == UIKeywords[j]) return true;
+                }
+            }
+
+            for (int j = 0; j < UIKeywords.Length; j++)
+            {
+                string kw = UIKeywords[j];
+                if (kw.Length > 2 && lower.Contains(kw)) return true;
+            }
+
+            return false;
+        }
 
         public IReadOnlyList<Camera> UICameras => uiCameras;
         public IReadOnlyList<Camera> WorldCameras => worldCameras;
@@ -117,6 +163,14 @@ namespace UnityRemix
                     continue;
                 }
 
+                // If camera matches excluded keywords (post-processing, virtual, shadow), classify as World
+                if (MatchesExcludedKeyword(camName))
+                {
+                    worldCameras.Add(cam);
+                    logger?.LogInfo($"[RemixUIDetector] Camera '{camName}' classified as World (matches excluded postprocess/utility keyword)");
+                    continue;
+                }
+
                 if (configAutoDetectUI != null && !configAutoDetectUI.Value)
                 {
                     // Auto-detect disabled: all non-manual cameras treated as World
@@ -124,9 +178,8 @@ namespace UnityRemix
                     continue;
                 }
 
-                // 2. Name-based heuristics
-                string lowerName = camName.ToLowerInvariant();
-                bool nameMatch = UIKeywords.Any(k => lowerName.Contains(k));
+                // 2. Name-based heuristics with tokenized matching
+                bool nameMatch = MatchesUIKeyword(camName);
 
                 // 3. Canvas association
                 bool isCanvasCam = canvasCameras.Contains(cam);
@@ -143,7 +196,7 @@ namespace UnityRemix
                 bool isOverlayClear = cam.clearFlags == CameraClearFlags.Depth || cam.clearFlags == CameraClearFlags.Nothing;
                 bool higherDepth = primaryWorld != null && cam.depth > primaryWorld.depth;
 
-                // Decision logic
+                // Decision logic: A UI camera must either match UI name, have a Canvas, or render exclusively UI layers
                 if (nameMatch || isCanvasCam || (rendersUILayer && avoidsDefaultLayer) || (isOverlayClear && higherDepth && hasRestrictedLayers))
                 {
                     uiCameras.Add(cam);
