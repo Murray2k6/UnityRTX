@@ -404,25 +404,39 @@ namespace UnityRemix
                     }
                     else
                     {
-                        // BakeMesh fallback: recreate mesh each frame with new vertex data
-                        IntPtr meshHandle = meshConverter.CreateRemixMeshFromData(
-                            skinned.remixMeshHash,
-                            skinned.vertices,
-                            skinned.normals,
-                            skinned.uvs,
-                            skinned.triangles,
-                            state.frameCount,
-                            skinned.materialId,
-                            skinned.colors
-                        );
-                        
-                        if (meshHandle == IntPtr.Zero)
-                            continue;
-                        
-                        meshConverter.UpdateSkinnedMeshHandle(skinned.remixMeshHash, meshHandle);
-                        updatedMeshes.Add(skinned.remixMeshHash);
-                        meshConverter.DrawMeshInstance(meshHandle, skinned.localToWorld, objectPickingValue);
-                        objectPickingValue++;
+                        IntPtr meshHandle;
+                        if (skinned.isStaticData &&
+                            meshConverter.TryGetSkinnedMeshHandle(skinned.remixMeshHash, out meshHandle) &&
+                            meshHandle != IntPtr.Zero)
+                        {
+                            // Static / cached mesh data unchanged: reuse existing Remix mesh handle!
+                            // Prevents generating new geom hashes every frame and preserves temporal history/motion vectors.
+                            updatedMeshes.Add(skinned.remixMeshHash);
+                            meshConverter.DrawMeshInstance(meshHandle, skinned.localToWorld, objectPickingValue);
+                            objectPickingValue++;
+                        }
+                        else
+                        {
+                            // BakeMesh fallback: recreate mesh with new vertex data
+                            meshHandle = meshConverter.CreateRemixMeshFromData(
+                                skinned.remixMeshHash,
+                                skinned.vertices,
+                                skinned.normals,
+                                skinned.uvs,
+                                skinned.triangles,
+                                state.frameCount,
+                                skinned.materialId,
+                                skinned.colors
+                            );
+
+                            if (meshHandle == IntPtr.Zero)
+                                continue;
+
+                            meshConverter.UpdateSkinnedMeshHandle(skinned.remixMeshHash, meshHandle);
+                            updatedMeshes.Add(skinned.remixMeshHash);
+                            meshConverter.DrawMeshInstance(meshHandle, skinned.localToWorld, objectPickingValue);
+                            objectPickingValue++;
+                        }
                     }
                 }
                 catch { }
