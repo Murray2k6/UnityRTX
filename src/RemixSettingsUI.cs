@@ -30,6 +30,10 @@ namespace UnityRemix
         private bool _enableSceneScan;
         private bool _sceneScanActiveOnly;
         private bool _persistDisabledRenderers;
+        private bool _singleWindow;
+        private bool _disableInEngineRendering;
+        private bool _autoDetectUI;
+        private bool _singleWindowUIOverlay;
         private string _selectedCameraName;
 
         public RemixSettingsUI(ManualLogSource log, UnityRemixPlugin plugin)
@@ -50,6 +54,7 @@ namespace UnityRemix
                 _initialized = true;
             }
 
+            DrawWindowSection();
             DrawRenderingSection();
             DrawCameraSection();
             DrawRendererSection();
@@ -66,6 +71,50 @@ namespace UnityRemix
             RemixImGui.SameLine();
             if (RemixImGui.Button("Refresh", 80, 0))
                 SyncFromConfig();
+        }
+
+        private void DrawWindowSection()
+        {
+            if (!RemixImGui.CollapsingHeader("Window", RemixImGui.TreeNodeFlags_DefaultOpen))
+                return;
+
+            if (RemixImGui.Checkbox("Single Window Mode", ref _singleWindow))
+                _plugin.SetConfig("SingleWindow", _singleWindow);
+            if (RemixImGui.IsItemHovered())
+                RemixImGui.SetTooltip("Embed Remix inside the game window or blit framebuffer.\nRequires game restart to reinitialize window hierarchy.");
+
+            if (_singleWindow)
+            {
+                RemixImGui.Indent();
+                if (RemixImGui.Checkbox("Disable In-Engine 3D Rendering", ref _disableInEngineRendering))
+                    _plugin.SetConfig("DisableInEngineRendering", _disableInEngineRendering);
+                if (RemixImGui.IsItemHovered())
+                    RemixImGui.SetTooltip("Stops Unity from rendering duplicate 3D scene rasterization passes.");
+
+                if (RemixImGui.Checkbox("Auto-Detect UI / HUD", ref _autoDetectUI))
+                    _plugin.SetConfig("AutoDetectUI", _autoDetectUI);
+                if (RemixImGui.IsItemHovered())
+                    RemixImGui.SetTooltip("Automatically detects UI/HUD cameras and Canvases, keeping them active.");
+
+                if (RemixImGui.Checkbox("UI Overlay Window (Embedded Mode)", ref _singleWindowUIOverlay))
+                    _plugin.SetConfig("SingleWindowUIOverlay", _singleWindowUIOverlay);
+                if (RemixImGui.IsItemHovered())
+                    RemixImGui.SetTooltip("Renders detected UI with per-pixel alpha directly over the embedded Remix viewport.");
+
+                var presenter = _plugin.FramebufferPresenter;
+                if (presenter?.UIDetector != null)
+                {
+                    var uiCams = presenter.UIDetector.UICameras;
+                    RemixImGui.Text($"Detected UI Cameras ({uiCams.Count}):");
+                    for (int i = 0; i < uiCams.Count; i++)
+                    {
+                        var c = uiCams[i];
+                        if (c != null)
+                            RemixImGui.Text($"  - {c.name} (Depth: {c.depth})");
+                    }
+                }
+                RemixImGui.Unindent();
+            }
         }
 
         private void DrawRenderingSection()
@@ -330,6 +379,10 @@ namespace UnityRemix
             _hardwareSkinning = _plugin.GetConfigBool("HardwareSkinning");
             _captureTextures = _plugin.GetConfigBool("CaptureTextures");
             _captureMaterials = _plugin.GetConfigBool("CaptureMaterials");
+            _singleWindow = _plugin.GetConfigBool("SingleWindow");
+            _disableInEngineRendering = _plugin.GetConfigBool("DisableInEngineRendering");
+            _autoDetectUI = _plugin.GetConfigBool("AutoDetectUI");
+            _singleWindowUIOverlay = _plugin.GetConfigBool("SingleWindowUIOverlay");
             _selectedCameraName = _plugin.GetConfigString("CameraName");
         }
 
