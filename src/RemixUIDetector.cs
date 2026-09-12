@@ -152,7 +152,7 @@ namespace UnityRemix
 
             foreach (var cam in allCameras)
             {
-                if (cam == null) continue;
+                if (cam == null || cam == dedicatedUICamera) continue;
                 logger?.LogInfo($"[RemixUIDetector]   Camera '{cam.name}' [depth={cam.depth}, clear={cam.clearFlags}, cullingMask=0x{cam.cullingMask:X} ({GetLayerNames(cam.cullingMask)}), targetTex='{cam.targetTexture?.name ?? "none"}', near={cam.nearClipPlane:F2}, far={cam.farClipPlane:F2}, parent='{cam.transform.parent?.name ?? "root"}', active={cam.gameObject.activeInHierarchy}, enabled={cam.enabled}]");
             }
 
@@ -169,7 +169,7 @@ namespace UnityRemix
 
             foreach (var cam in allCameras)
             {
-                if (cam == null) continue;
+                if (cam == null || cam == dedicatedUICamera) continue;
 
                 string camName = cam.name ?? "";
 
@@ -279,7 +279,11 @@ namespace UnityRemix
             {
                 if (canvas == null) continue;
 
-                if (canvas.renderMode == RenderMode.ScreenSpaceOverlay)
+                bool isOverlay = canvas.renderMode == RenderMode.ScreenSpaceOverlay;
+                bool needsRebinding = canvas.renderMode == RenderMode.ScreenSpaceCamera && 
+                    (canvas.worldCamera == null || (dedicatedUICamera != null && canvas.worldCamera == dedicatedUICamera && uiCamera != dedicatedUICamera));
+
+                if (isOverlay || needsRebinding)
                 {
                     if (!originalCanvasRenderModes.ContainsKey(canvas))
                     {

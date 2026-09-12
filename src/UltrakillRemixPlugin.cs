@@ -2,6 +2,7 @@ using System;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
+using HarmonyLib;
 using UnityEngine;
 
 namespace UnityRemix
@@ -93,6 +94,18 @@ namespace UnityRemix
             
             LogSource.LogInfo($"GameObject: {gameObject.name}, Active: {gameObject.activeSelf}, Enabled: {enabled}");
             
+            // Apply Harmony patches (e.g. MeshAccessPatch and UltrakillPostProcessPatch)
+            try
+            {
+                var harmony = new Harmony(PluginGUID);
+                MeshAccessPatch.Apply(harmony);
+                UltrakillPostProcessPatch.Apply(harmony, LogSource);
+            }
+            catch (Exception ex)
+            {
+                LogSource.LogError($"Failed to apply Harmony patches: {ex}");
+            }
+
             // Subscribe to scene events
             UnityEngine.SceneManagement.SceneManager.sceneLoaded += OnSceneLoaded;
             

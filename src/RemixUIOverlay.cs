@@ -186,10 +186,33 @@ namespace UnityRemix
 
         #endregion
 
+        public static RemixUIOverlay Instance { get; private set; }
+        private readonly HashSet<Camera> managedCameras = new HashSet<Camera>();
+
+        public static bool IsManagedUICamera(Camera cam)
+        {
+            if (cam == null || Instance == null) return false;
+            return Instance.managedCameras.Contains(cam);
+        }
+
+        public void RebindAllUICameras()
+        {
+            if (uiRenderTexture == null) return;
+            foreach (var cam in managedCameras)
+            {
+                if (cam == null) continue;
+                cam.targetTexture = uiRenderTexture;
+                cam.SetTargetBuffers(uiRenderTexture.colorBuffer, uiRenderTexture.depthBuffer);
+                cam.clearFlags = CameraClearFlags.SolidColor;
+                cam.backgroundColor = new Color(0, 0, 0, 0);
+            }
+        }
+
         public RemixUIOverlay(ManualLogSource logger, IntPtr gameWindow)
         {
             this.logger = logger;
             this.gameWindow = gameWindow;
+            Instance = this;
         }
 
         public bool Initialize()
@@ -243,10 +266,12 @@ namespace UnityRemix
 
             EnsureRenderTexture(width, height);
 
+            managedCameras.Clear();
             bool isFirst = true;
             foreach (var cam in uiCameras)
             {
                 if (cam == null) continue;
+                managedCameras.Add(cam);
 
                 if (!originalCameraStates.ContainsKey(cam))
                 {
@@ -352,27 +377,35 @@ namespace UnityRemix
                         byte b = s[2];
                         byte a = s[3];
 
-                        if (a > maxA) maxA = a;
-                        if (a > 200) opaquePixelCount++;
                         if (a > 0 || r > 0 || g > 0 || b > 0) nonZeroPixelCount++;
 
-                        if (a == 255)
+                        // Fallback for additive / unlit UI shaders that output color with a == 0
+                        byte effA = a;
+                        if (effA == 0 && (r > 0 || g > 0 || b > 0))
+                        {
+                            effA = (byte)Math.Max(r, Math.Max(g, b));
+                        }
+
+                        if (effA > maxA) maxA = effA;
+                        if (effA > 200) opaquePixelCount++;
+
+                        if (effA == 255)
                         {
                             d[0] = b;
                             d[1] = g;
                             d[2] = r;
                             d[3] = 255;
                         }
-                        else if (a == 0)
+                        else if (effA == 0)
                         {
                             *(uint*)d = 0;
                         }
                         else
                         {
-                            d[0] = (byte)((b * a) / 255);
-                            d[1] = (byte)((g * a) / 255);
-                            d[2] = (byte)((r * a) / 255);
-                            d[3] = a;
+                            d[0] = (byte)((b * effA) / 255);
+                            d[1] = (byte)((g * effA) / 255);
+                            d[2] = (byte)((r * effA) / 255);
+                            d[3] = effA;
                         }
 
                         s += 4;
@@ -389,7 +422,7 @@ namespace UnityRemix
                 logger?.LogInfo($"[RemixUIOverlay] Frame #{updateLogCounter}: {width}x{height}, nonZero={nonZeroPixelCount}, opaque={opaquePixelCount} ({opaqueRatio:P2}), maxAlpha={maxA}, center=(R={rawPixels[centerIdx]},G={rawPixels[centerIdx+1]},B={rawPixels[centerIdx+2]},A={rawPixels[centerIdx+3]}), visible={isOverlayVisible}");
             }
 
-            if (opaqueRatio > 0.85f)
+            if (opaqueRatio > 0.98f)
             {
                 if (!hasLoggedOpaqueWarning)
                 {
@@ -569,6 +602,7 @@ namespace UnityRemix
             }
 
             originalCameraStates.Clear();
+            managedCameras.Clear();
             logger?.LogInfo("[RemixUIOverlay] Restored original UI camera settings.");
         }
 
@@ -576,6 +610,11 @@ namespace UnityRemix
         {
             RestoreUICameras();
             CleanupDIB();
+
+            if (Instance == this)
+            {
+                Instance = null;
+            }
 
             if (uiRenderTexture != null)
             {
@@ -617,14 +656,24 @@ namespace UnityRemix
             cam = GetComponent<Camera>();
         }
 
+        void OnPreCull()
+        {
+            EnsureConfigured("OnPreCull");
+        }
+
         void OnPreRender()
+        {
+            EnsureConfigured("OnPreRender");
+        }
+
+        private void EnsureConfigured(string stage)
         {
             if (cam == null) cam = GetComponent<Camera>();
             if (cam != null && targetTexture != null)
             {
-                if (hookCount++ < 15 || hookCount % 180 == 0)
+                if (stage == "OnPreRender" && (hookCount++ < 15 || hookCount % 180 == 0))
                 {
-                    logger?.LogInfo($"[RemixUICameraHook] #{hookCount} OnPreRender on '{cam.name}' - preTarget='{cam.targetTexture?.name ?? "null"}', preClear={cam.clearFlags}, preMask=0x{cam.cullingMask:X}, assigning target '{targetTexture.name}'");
+                    logger?.LogInfo($"[RemixUICameraHook] #{hookCount} {stage} on '{cam.name}' - preTarget='{cam.targetTexture?.name ?? "null"}', preClear={cam.clearFlags}, preMask=0x{cam.cullingMask:X}, assigning target '{targetTexture.name}'");
                 }
 
                 cam.targetTexture = targetTexture;

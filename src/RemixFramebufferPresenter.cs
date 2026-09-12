@@ -44,6 +44,7 @@ namespace UnityRemix
         private RemixCameraBlitter currentCameraBlitter;
 
         public RemixUIDetector UIDetector => uiDetector;
+        public static bool IsSingleWindowUIActive { get; private set; }
 
         public void Initialize(
             ManualLogSource logger,
@@ -73,7 +74,16 @@ namespace UnityRemix
                 null
             );
 
+            UpdateSingleWindowUIActive();
             logger?.LogInfo($"[RemixFramebufferPresenter] Initialized (SingleWindow: {singleWindow.Value}, Method: {singleWindowMethod.Value}, SuppressInEngine: {disableInEngineRendering.Value}, AutoDetectUI: {autoDetectUI.Value})");
+        }
+
+        private void UpdateSingleWindowUIActive()
+        {
+            bool isSingle = configSingleWindow != null && configSingleWindow.Value;
+            bool isEmbedded = configSingleWindowMethod != null && configSingleWindowMethod.Value == SingleWindowMethod.Embedded;
+            bool isSuppressed = configDisableInEngineRendering != null && configDisableInEngineRendering.Value;
+            IsSingleWindowUIActive = isSingle && isEmbedded && isSuppressed;
         }
 
         private int lastCameraCount = -1;
@@ -90,28 +100,38 @@ namespace UnityRemix
         {
             if (configSingleWindow == null) return;
 
+            UpdateSingleWindowUIActive();
+
             bool isSingle = configSingleWindow.Value;
             bool shouldSuppress = isSingle && configDisableInEngineRendering.Value;
 
             int currentCameraCount = Camera.allCamerasCount;
-            int currentCanvasCount = UnityEngine.Object.FindObjectsOfType<Canvas>().Length;
-            bool countsChanged = (currentCameraCount != lastCameraCount) || (currentCanvasCount != lastCanvasCount);
+            bool cameraCountChanged = (currentCameraCount != lastCameraCount);
+            bool periodicCheck = (frameCount % 60 == 0);
+            bool shouldCheck = (shouldSuppress != inEngineRenderingSuppressed) || cameraCountChanged || periodicCheck || (sceneRefreshCounter > 0);
 
-            if (shouldSuppress != inEngineRenderingSuppressed || (sceneRefreshCounter > 0 && countsChanged))
+            if (shouldCheck)
             {
                 if (sceneRefreshCounter > 0) sceneRefreshCounter--;
-                lastCameraCount = currentCameraCount;
-                lastCanvasCount = currentCanvasCount;
 
-                if (shouldSuppress)
-                    ApplyInEngineRenderingSuppression();
-                else
-                    RestoreInEngineRendering();
+                int currentCanvasCount = UnityEngine.Object.FindObjectsOfType<Canvas>().Length;
+                bool countsChanged = cameraCountChanged || (currentCanvasCount != lastCanvasCount);
+
+                if (shouldSuppress != inEngineRenderingSuppressed || countsChanged)
+                {
+                    lastCameraCount = currentCameraCount;
+                    lastCanvasCount = currentCanvasCount;
+
+                    if (shouldSuppress)
+                        ApplyInEngineRenderingSuppression();
+                    else
+                        RestoreInEngineRendering();
+                }
             }
 
             if (frameCount % 300 == 0 && isSingle)
             {
-                logger?.LogInfo($"[RemixFramebufferPresenter] Frame #{frameCount} Status: SingleWindow={isSingle}, Suppressed={inEngineRenderingSuppressed}, WorldCams={uiDetector.WorldCameras.Count}, UICams={uiDetector.UICameras.Count}, Canvases={currentCanvasCount}, OverlayActive={(uiOverlay != null)}");
+                logger?.LogInfo($"[RemixFramebufferPresenter] Frame #{frameCount} Status: SingleWindow={isSingle}, Suppressed={inEngineRenderingSuppressed}, WorldCams={uiDetector.WorldCameras.Count}, UICams={uiDetector.UICameras.Count}, Canvases={lastCanvasCount}, OverlayActive={(uiOverlay != null)}");
             }
 
             // Sync embedded window bounds
