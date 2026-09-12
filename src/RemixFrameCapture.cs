@@ -841,25 +841,29 @@ namespace UnityRemix
                 var c = queueCopy[i];
                 if (c == null) continue;
 
-                var mrs = c.GetComponentsInChildren<MeshRenderer>(true);
-                for (int j = 0; j < mrs.Length; j++)
+                try
                 {
-                    var r = mrs[j];
-                    if (r != null && cachedRendererIds.Add(r.GetInstanceID()))
+                    var mrs = c.GetComponentsInChildren<MeshRenderer>(true);
+                    for (int j = 0; j < mrs.Length; j++)
                     {
-                        cachedRenderers.Add(r);
+                        var r = mrs[j];
+                        if (r != null && cachedRendererIds.Add(r.GetInstanceID()))
+                        {
+                            cachedRenderers.Add(r);
+                        }
                     }
-                }
 
-                var smrs = c.GetComponentsInChildren<SkinnedMeshRenderer>(true);
-                for (int j = 0; j < smrs.Length; j++)
-                {
-                    var sr = smrs[j];
-                    if (sr != null && cachedSkinnedRendererIds.Add(sr.GetInstanceID()))
+                    var smrs = c.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+                    for (int j = 0; j < smrs.Length; j++)
                     {
-                        cachedSkinnedRenderers.Add(sr);
+                        var sr = smrs[j];
+                        if (sr != null && cachedSkinnedRendererIds.Add(sr.GetInstanceID()))
+                        {
+                            cachedSkinnedRenderers.Add(sr);
+                        }
                     }
                 }
+                catch { }
             }
         }
 

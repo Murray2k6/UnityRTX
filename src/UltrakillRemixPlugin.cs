@@ -89,11 +89,10 @@ namespace UnityRemix
             // Subscribe to scene events
             UnityEngine.SceneManagement.SceneManager.sceneLoaded += OnSceneLoaded;
             
-            // Apply Harmony patches (e.g. non-readable mesh access, dynamic object spawn hooks)
+            // Apply Harmony patches for instant dynamic object tracking
             try
             {
                 var harmony = new Harmony(PluginGUID);
-                MeshAccessPatch.Apply(harmony);
                 DynamicSpawnPatch.Apply(harmony, LogSource);
             }
             catch (Exception ex)

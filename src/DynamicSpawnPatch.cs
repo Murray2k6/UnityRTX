@@ -69,10 +69,14 @@ namespace UnityRemix
 
         private static void OnDynamicSpawned(Component __instance)
         {
-            if (__instance != null)
+            try
             {
-                RemixFrameCapture.QueueDynamicObjectForTracking(__instance);
+                if (__instance != null)
+                {
+                    RemixFrameCapture.QueueDynamicObjectForTracking(__instance);
+                }
             }
+            catch { }
         }
     }
 }
