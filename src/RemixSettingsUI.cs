@@ -30,6 +30,8 @@ namespace UnityRemix
         private bool _enableSceneScan;
         private bool _sceneScanActiveOnly;
         private bool _persistDisabledRenderers;
+        private bool _singleWindow;
+        private bool _disableInEngineRendering;
         private string _selectedCameraName;
 
         public RemixSettingsUI(ManualLogSource log, UnityRemixPlugin plugin)
@@ -50,6 +52,7 @@ namespace UnityRemix
                 _initialized = true;
             }
 
+            DrawWindowSection();
             DrawRenderingSection();
             DrawCameraSection();
             DrawRendererSection();
@@ -66,6 +69,27 @@ namespace UnityRemix
             RemixImGui.SameLine();
             if (RemixImGui.Button("Refresh", 80, 0))
                 SyncFromConfig();
+        }
+
+        private void DrawWindowSection()
+        {
+            if (!RemixImGui.CollapsingHeader("Window", RemixImGui.TreeNodeFlags_DefaultOpen))
+                return;
+
+            if (RemixImGui.Checkbox("Single Window Mode", ref _singleWindow))
+                _plugin.SetConfig("SingleWindow", _singleWindow);
+            if (RemixImGui.IsItemHovered())
+                RemixImGui.SetTooltip("Embed Remix inside the game window or blit framebuffer.\nRequires game restart to reinitialize window hierarchy.");
+
+            if (_singleWindow)
+            {
+                RemixImGui.Indent();
+                if (RemixImGui.Checkbox("Disable In-Engine 3D Rendering", ref _disableInEngineRendering))
+                    _plugin.SetConfig("DisableInEngineRendering", _disableInEngineRendering);
+                if (RemixImGui.IsItemHovered())
+                    RemixImGui.SetTooltip("Stops Unity from rendering duplicate 3D scene rasterization passes.");
+                RemixImGui.Unindent();
+            }
         }
 
         private void DrawRenderingSection()
@@ -330,6 +354,8 @@ namespace UnityRemix
             _hardwareSkinning = _plugin.GetConfigBool("HardwareSkinning");
             _captureTextures = _plugin.GetConfigBool("CaptureTextures");
             _captureMaterials = _plugin.GetConfigBool("CaptureMaterials");
+            _singleWindow = _plugin.GetConfigBool("SingleWindow");
+            _disableInEngineRendering = _plugin.GetConfigBool("DisableInEngineRendering");
             _selectedCameraName = _plugin.GetConfigString("CameraName");
         }
 

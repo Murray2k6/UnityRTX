@@ -45,6 +45,11 @@ namespace UnityRemix
         private ConfigEntry<string> configDisabledLayers;
         private ConfigEntry<bool> configPersistDisabledRenderers;
         
+        // Single Window settings
+        private ConfigEntry<bool> configSingleWindow;
+        private ConfigEntry<SingleWindowMethod> configSingleWindowMethod;
+        private ConfigEntry<bool> configDisableInEngineRendering;
+        
         public static ManualLogSource LogSource { get; private set; }
         private RemixAPI.remixapi_Interface remixInterface;
         private IntPtr remixDll = IntPtr.Zero;
@@ -53,6 +58,7 @@ namespace UnityRemix
         
         // COMPONENTS - All functionality delegated to these
         private RemixWindowManager windowManager;
+        private RemixFramebufferPresenter framebufferPresenter;
         private RemixCameraHandler cameraHandler;
         private RemixLightConverter lightConverter;
         private RemixMaterialManager materialManager;
@@ -178,11 +184,22 @@ namespace UnityRemix
             configDisabledLayers = Config.Bind("Rendering", "DisabledLayers", "",
                 "Comma-separated list of Unity layer indices to disable (e.g. '8,13,21'). Managed by the in-game UI.");
             
+            // Single Window Settings
+            configSingleWindow = Config.Bind("Window", "SingleWindow", false,
+                "Render RTX Remix inside a single window instead of separate game and Remix windows.");
+
+            configSingleWindowMethod = Config.Bind("Window", "SingleWindowMethod", SingleWindowMethod.Embedded,
+                "Method used for single window mode: Embedded (zero performance loss, native child window) or Copy (blits framebuffer into engine).");
+
+            configDisableInEngineRendering = Config.Bind("Window", "DisableInEngineRendering", true,
+                "Suppresses Unity's 3D scene rasterization passes when single window mode is enabled, eliminating duplicate rendering work.");
+
             LogSource.LogInfo("Configuration loaded:");
             LogSource.LogInfo($"  Camera Name: '{configCameraName.Value}' (empty = auto-detect)");
             LogSource.LogInfo($"  Camera Tag: '{configCameraTag.Value}'");
             LogSource.LogInfo($"  Game Geometry: {configUseGameGeometry.Value}");
             LogSource.LogInfo($"  Target FPS: {(configTargetFPS.Value == 0 ? "Uncapped" : configTargetFPS.Value.ToString())}");
+            LogSource.LogInfo($"  Single Window: {configSingleWindow.Value} (Method: {configSingleWindowMethod.Value}, SuppressInEngine: {configDisableInEngineRendering.Value})");
         }
         
         private void OnSceneLoaded(UnityEngine.SceneManagement.Scene scene, UnityEngine.SceneManagement.LoadSceneMode mode)
@@ -272,7 +289,16 @@ namespace UnityRemix
             // Create all components with dependencies
             textureCategoryManager = new TextureCategoryManager();
             
-            windowManager = new RemixWindowManager(LogSource, remixInterface);
+            windowManager = new RemixWindowManager(LogSource, remixInterface, configSingleWindow, configSingleWindowMethod);
+            
+            framebufferPresenter = gameObject.AddComponent<RemixFramebufferPresenter>();
+            framebufferPresenter.Initialize(
+                LogSource,
+                windowManager,
+                configSingleWindow,
+                configSingleWindowMethod,
+                configDisableInEngineRendering
+            );
             
             cameraHandler = new RemixCameraHandler(
                 LogSource,
@@ -573,6 +599,8 @@ namespace UnityRemix
                 case "EnableSceneScan": return configEnableSceneScan.Value;
                 case "ActiveRenderersOnly": return configSceneScanActiveOnly.Value;
                 case "PersistDisabledRenderers": return configPersistDisabledRenderers.Value;
+                case "SingleWindow": return configSingleWindow.Value;
+                case "DisableInEngineRendering": return configDisableInEngineRendering.Value;
                 default: return false;
             }
         }
@@ -593,6 +621,7 @@ namespace UnityRemix
             {
                 case "CameraName": return configCameraName.Value;
                 case "DisabledLayers": return configDisabledLayers.Value;
+                case "SingleWindowMethod": return configSingleWindowMethod.Value.ToString();
                 default: return "";
             }
         }
@@ -603,6 +632,10 @@ namespace UnityRemix
             {
                 case "CameraName": configCameraName.Value = value; break;
                 case "DisabledLayers": configDisabledLayers.Value = value; break;
+                case "SingleWindowMethod":
+                    if (Enum.TryParse<SingleWindowMethod>(value, true, out var method))
+                        configSingleWindowMethod.Value = method;
+                    break;
             }
         }
 
@@ -631,6 +664,8 @@ namespace UnityRemix
                 case "EnableSceneScan": configEnableSceneScan.Value = value; break;
                 case "ActiveRenderersOnly": configSceneScanActiveOnly.Value = value; break;
                 case "PersistDisabledRenderers": configPersistDisabledRenderers.Value = value; break;
+                case "SingleWindow": configSingleWindow.Value = value; break;
+                case "DisableInEngineRendering": configDisableInEngineRendering.Value = value; break;
             }
         }
 
@@ -664,6 +699,8 @@ namespace UnityRemix
         public RemixMaterialManager MaterialManager => materialManager;
 
         public RemixLightConverter LightConverter => lightConverter;
+
+        public RemixFramebufferPresenter FramebufferPresenter => framebufferPresenter;
 
         #endregion
     }
