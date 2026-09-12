@@ -77,11 +77,13 @@ namespace UnityRemix
         }
 
         private int lastCameraCount = -1;
+        private int lastCanvasCount = -1;
 
         public void OnSceneLoaded(UnityEngine.SceneManagement.Scene scene)
         {
-            sceneRefreshCounter = 10; // Re-evaluate suppression over the next 10 frames to catch async objects
+            sceneRefreshCounter = 15; // Re-evaluate suppression over the next 15 frames to catch async objects
             lastCameraCount = -1;
+            lastCanvasCount = -1;
         }
 
         public void Update(int frameCount)
@@ -92,17 +94,24 @@ namespace UnityRemix
             bool shouldSuppress = isSingle && configDisableInEngineRendering.Value;
 
             int currentCameraCount = Camera.allCamerasCount;
-            bool cameraCountChanged = currentCameraCount != lastCameraCount;
+            int currentCanvasCount = UnityEngine.Object.FindObjectsOfType<Canvas>().Length;
+            bool countsChanged = (currentCameraCount != lastCameraCount) || (currentCanvasCount != lastCanvasCount);
 
-            if (shouldSuppress != inEngineRenderingSuppressed || (sceneRefreshCounter > 0 && cameraCountChanged))
+            if (shouldSuppress != inEngineRenderingSuppressed || (sceneRefreshCounter > 0 && countsChanged))
             {
                 if (sceneRefreshCounter > 0) sceneRefreshCounter--;
                 lastCameraCount = currentCameraCount;
+                lastCanvasCount = currentCanvasCount;
 
                 if (shouldSuppress)
                     ApplyInEngineRenderingSuppression();
                 else
                     RestoreInEngineRendering();
+            }
+
+            if (frameCount % 300 == 0 && isSingle)
+            {
+                logger?.LogInfo($"[RemixFramebufferPresenter] Frame #{frameCount} Status: SingleWindow={isSingle}, Suppressed={inEngineRenderingSuppressed}, WorldCams={uiDetector.WorldCameras.Count}, UICams={uiDetector.UICameras.Count}, Canvases={currentCanvasCount}, OverlayActive={(uiOverlay != null)}");
             }
 
             // Sync embedded window bounds

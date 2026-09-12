@@ -94,6 +94,20 @@ namespace UnityRemix
             this.configCameraName = cameraName;
         }
 
+        private static string GetLayerNames(int mask)
+        {
+            var layers = new List<string>();
+            for (int i = 0; i < 32; i++)
+            {
+                if ((mask & (1 << i)) != 0)
+                {
+                    string name = LayerMask.LayerToName(i);
+                    layers.Add(string.IsNullOrEmpty(name) ? i.ToString() : $"{name}({i})");
+                }
+            }
+            return layers.Count > 0 ? string.Join(",", layers) : "Nothing(0)";
+        }
+
         /// <summary>
         /// Scans all active cameras in the scene and categorizes them into World and UI cameras.
         /// </summary>
@@ -122,12 +136,24 @@ namespace UnityRemix
             // Find known canvases and their worldCameras
             var canvases = UnityEngine.Object.FindObjectsOfType<Canvas>();
             var canvasCameras = new HashSet<Camera>();
+
+            logger?.LogInfo($"[RemixUIDetector] --- Scan Started ({allCameras.Length} cameras, {canvases.Length} canvases) ---");
+
             foreach (var canvas in canvases)
             {
-                if (canvas != null && canvas.renderMode == RenderMode.ScreenSpaceCamera && canvas.worldCamera != null)
+                if (canvas == null) continue;
+                logger?.LogInfo($"[RemixUIDetector]   Canvas '{canvas.name}' [layer={LayerMask.LayerToName(canvas.gameObject.layer)}({canvas.gameObject.layer}), mode={canvas.renderMode}, cam='{canvas.worldCamera?.name ?? "none"}', planeDist={canvas.planeDistance:F2}, order={canvas.sortingOrder}, active={canvas.gameObject.activeInHierarchy}, enabled={canvas.enabled}]");
+
+                if (canvas.renderMode == RenderMode.ScreenSpaceCamera && canvas.worldCamera != null)
                 {
                     canvasCameras.Add(canvas.worldCamera);
                 }
+            }
+
+            foreach (var cam in allCameras)
+            {
+                if (cam == null) continue;
+                logger?.LogInfo($"[RemixUIDetector]   Camera '{cam.name}' [depth={cam.depth}, clear={cam.clearFlags}, cullingMask=0x{cam.cullingMask:X} ({GetLayerNames(cam.cullingMask)}), targetTex='{cam.targetTexture?.name ?? "none"}', near={cam.nearClipPlane:F2}, far={cam.farClipPlane:F2}, parent='{cam.transform.parent?.name ?? "root"}', active={cam.gameObject.activeInHierarchy}, enabled={cam.enabled}]");
             }
 
             int uiLayer = LayerMask.NameToLayer("UI");
@@ -237,7 +263,17 @@ namespace UnityRemix
 
                     canvas.renderMode = RenderMode.ScreenSpaceCamera;
                     canvas.worldCamera = uiCamera;
-                    canvas.planeDistance = 1.0f;
+                    canvas.planeDistance = Mathf.Clamp(uiCamera.nearClipPlane + 0.1f, 0.1f, 100f);
+
+                    // Ensure camera culling mask includes canvas layer so it is actually rendered
+                    int canvasLayerBit = 1 << canvas.gameObject.layer;
+                    if ((uiCamera.cullingMask & canvasLayerBit) == 0)
+                    {
+                        uiCamera.cullingMask |= canvasLayerBit;
+                        logger?.LogInfo($"[RemixUIDetector] Added layer {LayerMask.LayerToName(canvas.gameObject.layer)}({canvas.gameObject.layer}) to UI camera '{uiCamera.name}' culling mask");
+                    }
+
+                    logger?.LogInfo($"[RemixUIDetector] Routed Overlay Canvas '{canvas.name}' to ScreenSpaceCamera (cam: '{uiCamera.name}', planeDist: {canvas.planeDistance:F2}, layer: {canvas.gameObject.layer})");
                 }
             }
         }

@@ -62,6 +62,7 @@ namespace UnityRemix
 
         private bool isOverlayVisible = true;
         private bool hasLoggedOpaqueWarning = false;
+        private int updateLogCounter = 0;
 
         [DllImport("user32.dll")]
         private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
@@ -266,6 +267,7 @@ namespace UnityRemix
                 {
                     hook = cam.gameObject.AddComponent<RemixUICameraHook>();
                 }
+                hook.logger = logger;
                 hook.targetTexture = uiRenderTexture;
                 hook.clearFlags = targetClear;
                 hook.backgroundColor = targetBg;
@@ -309,6 +311,8 @@ namespace UnityRemix
             EnsureDIB(width, height);
             if (overlayHdc == IntPtr.Zero || overlayBits == IntPtr.Zero) return;
 
+            bool diagLog = (updateLogCounter++ < 20) || (updateLogCounter % 120 == 0);
+
             // Readback from RenderTexture
             if (readbackTexture == null || readbackTexture.width != width || readbackTexture.height != height)
             {
@@ -330,6 +334,7 @@ namespace UnityRemix
             int opaquePixelCount = 0;
             int nonZeroPixelCount = 0;
             int totalPixels = width * height;
+            byte maxA = 0;
 
             // Convert RGBA to BGRA with premultiplied alpha for UpdateLayeredWindow
             unsafe
@@ -347,6 +352,7 @@ namespace UnityRemix
                         byte b = s[2];
                         byte a = s[3];
 
+                        if (a > maxA) maxA = a;
                         if (a > 200) opaquePixelCount++;
                         if (a > 0 || r > 0 || g > 0 || b > 0) nonZeroPixelCount++;
 
@@ -375,10 +381,14 @@ namespace UnityRemix
                 }
             }
 
-            // CRITICAL WATCHDOG: If > 85% of pixels are opaque, this is NOT a transparent UI overlay!
-            // It is an opaque full-screen camera clear or full-screen post-processing blit.
-            // Drawing this on the layered window would turn the entire screen black or opaque!
             float opaqueRatio = (float)opaquePixelCount / totalPixels;
+
+            if (diagLog)
+            {
+                int centerIdx = (height / 2 * width + width / 2) * 4;
+                logger?.LogInfo($"[RemixUIOverlay] Frame #{updateLogCounter}: {width}x{height}, nonZero={nonZeroPixelCount}, opaque={opaquePixelCount} ({opaqueRatio:P2}), maxAlpha={maxA}, center=(R={rawPixels[centerIdx]},G={rawPixels[centerIdx+1]},B={rawPixels[centerIdx+2]},A={rawPixels[centerIdx+3]}), visible={isOverlayVisible}");
+            }
+
             if (opaqueRatio > 0.85f)
             {
                 if (!hasLoggedOpaqueWarning)
@@ -401,6 +411,10 @@ namespace UnityRemix
             // If completely empty (no UI pixels rendered at all), hide overlay
             if (nonZeroPixelCount == 0)
             {
+                if (diagLog)
+                {
+                    logger?.LogInfo($"[RemixUIOverlay] Frame #{updateLogCounter}: Overlay hidden because nonZeroPixelCount == 0 (no UI drawn into RenderTexture).");
+                }
                 if (isOverlayVisible)
                 {
                     ShowWindow(overlayWindow, SW_HIDE);
@@ -423,7 +437,7 @@ namespace UnityRemix
                 AlphaFormat = AC_SRC_ALPHA
             };
 
-            UpdateLayeredWindow(
+            bool ok = UpdateLayeredWindow(
                 overlayWindow,
                 IntPtr.Zero,
                 ref ptDst,
@@ -434,6 +448,16 @@ namespace UnityRemix
                 ref blend,
                 ULW_ALPHA
             );
+
+            if (!ok)
+            {
+                int err = Marshal.GetLastWin32Error();
+                logger?.LogError($"[RemixUIOverlay] UpdateLayeredWindow failed! Win32 Error: {err}");
+            }
+            else if (diagLog)
+            {
+                logger?.LogInfo($"[RemixUIOverlay] UpdateLayeredWindow succeeded at ({ptDst.x},{ptDst.y},{sizeDst.cx},{sizeDst.cy})");
+            }
 
             if (!isOverlayVisible)
             {
@@ -583,8 +607,10 @@ namespace UnityRemix
         public RenderTexture targetTexture;
         public CameraClearFlags clearFlags = CameraClearFlags.Depth;
         public Color backgroundColor = new Color(0, 0, 0, 0);
+        public ManualLogSource logger;
 
         private Camera cam;
+        private int hookCount = 0;
 
         void Awake()
         {
@@ -596,9 +622,23 @@ namespace UnityRemix
             if (cam == null) cam = GetComponent<Camera>();
             if (cam != null && targetTexture != null)
             {
+                if (hookCount++ < 15 || hookCount % 180 == 0)
+                {
+                    logger?.LogInfo($"[RemixUICameraHook] #{hookCount} OnPreRender on '{cam.name}' - preTarget='{cam.targetTexture?.name ?? "null"}', preClear={cam.clearFlags}, preMask=0x{cam.cullingMask:X}, assigning target '{targetTexture.name}'");
+                }
+
                 cam.targetTexture = targetTexture;
+                cam.SetTargetBuffers(targetTexture.colorBuffer, targetTexture.depthBuffer);
                 cam.clearFlags = clearFlags;
                 cam.backgroundColor = backgroundColor;
+            }
+        }
+
+        void OnPostRender()
+        {
+            if (hookCount <= 15 || hookCount % 180 == 0)
+            {
+                logger?.LogInfo($"[RemixUICameraHook] #{hookCount} OnPostRender on '{cam?.name}' finished.");
             }
         }
     }
