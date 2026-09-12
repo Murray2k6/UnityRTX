@@ -470,8 +470,10 @@ namespace UnityRemix
             int[] triangles, 
             int frameHash,
             int materialId = 0,
-            Color32[] colors = null)
+            Color32[] colors = null,
+            ulong poolKey = 0)
         {
+            if (poolKey == 0) poolKey = meshHash;
             if (vertices == null || vertices.Length == 0 || triangles == null || triangles.Length == 0)
                 return IntPtr.Zero;
             
@@ -507,7 +509,7 @@ namespace UnityRemix
             }
             
             // Use pooled GCHandles
-            if (!pinnedMeshPool.TryGetValue(meshHash, out PinnedMeshData poolData))
+            if (!pinnedMeshPool.TryGetValue(poolKey, out PinnedMeshData poolData))
             {
                 poolData = new PinnedMeshData
                 {
@@ -571,7 +573,7 @@ namespace UnityRemix
                 poolData.vertexHandle = GCHandle.Alloc(poolData.vertices, GCHandleType.Pinned);
                 poolData.indexHandle = GCHandle.Alloc(poolData.indices, GCHandleType.Pinned);
                 poolData.isPinned = true;
-                pinnedMeshPool[meshHash] = poolData;
+                pinnedMeshPool[poolKey] = poolData;
             }
             
             // Get or create material handle for skinned mesh (on render thread)
@@ -907,18 +909,21 @@ namespace UnityRemix
             // Queue old handle for deferred destruction (prevents flickering)
             if (skinnedMeshHandles.TryGetValue(meshHash, out IntPtr oldHandle) && oldHandle != IntPtr.Zero)
             {
-                // Don't destroy immediately - queue it for later
-                deferredDestroyQueue.Enqueue(oldHandle);
-                
-                // Process deferred destruction queue (destroy oldest handles)
-                while (deferredDestroyQueue.Count > DEFERRED_DESTROY_FRAMES && destroyMeshFunc != null)
+                if (oldHandle != newHandle)
                 {
-                    IntPtr handleToDestroy = deferredDestroyQueue.Dequeue();
-                    try
+                    // Don't destroy immediately - queue it for later
+                    deferredDestroyQueue.Enqueue(oldHandle);
+                    
+                    // Process deferred destruction queue (destroy oldest handles)
+                    while (deferredDestroyQueue.Count > DEFERRED_DESTROY_FRAMES && destroyMeshFunc != null)
                     {
-                        destroyMeshFunc(handleToDestroy);
+                        IntPtr handleToDestroy = deferredDestroyQueue.Dequeue();
+                        try
+                        {
+                            destroyMeshFunc(handleToDestroy);
+                        }
+                        catch { }
                     }
-                    catch { }
                 }
             }
             

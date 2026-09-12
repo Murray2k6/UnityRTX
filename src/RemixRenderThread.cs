@@ -404,14 +404,18 @@ namespace UnityRemix
                     }
                     else
                     {
+                        ulong trackingKey = skinned.meshId != 0 
+                            ? (0x7F00000000000000UL | (ulong)(uint)skinned.meshId) 
+                            : skinned.remixMeshHash;
+
                         IntPtr meshHandle;
                         if (skinned.isStaticData &&
-                            meshConverter.TryGetSkinnedMeshHandle(skinned.remixMeshHash, out meshHandle) &&
+                            meshConverter.TryGetSkinnedMeshHandle(trackingKey, out meshHandle) &&
                             meshHandle != IntPtr.Zero)
                         {
                             // Static / cached mesh data unchanged: reuse existing Remix mesh handle!
                             // Prevents generating new geom hashes every frame and preserves temporal history/motion vectors.
-                            updatedMeshes.Add(skinned.remixMeshHash);
+                            updatedMeshes.Add(trackingKey);
                             meshConverter.DrawMeshInstance(meshHandle, skinned.localToWorld, objectPickingValue);
                             objectPickingValue++;
                         }
@@ -426,14 +430,15 @@ namespace UnityRemix
                                 skinned.triangles,
                                 state.frameCount,
                                 skinned.materialId,
-                                skinned.colors
+                                skinned.colors,
+                                poolKey: trackingKey
                             );
 
                             if (meshHandle == IntPtr.Zero)
                                 continue;
 
-                            meshConverter.UpdateSkinnedMeshHandle(skinned.remixMeshHash, meshHandle);
-                            updatedMeshes.Add(skinned.remixMeshHash);
+                            meshConverter.UpdateSkinnedMeshHandle(trackingKey, meshHandle);
+                            updatedMeshes.Add(trackingKey);
                             meshConverter.DrawMeshInstance(meshHandle, skinned.localToWorld, objectPickingValue);
                             objectPickingValue++;
                         }
