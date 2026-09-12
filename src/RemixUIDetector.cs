@@ -235,10 +235,36 @@ namespace UnityRemix
                 }
             }
 
+            // If no native UI camera was found (e.g. main menu, title screens), create a dedicated UI camera
+            if (uiCameras.Count == 0 && (configAutoDetectUI == null || configAutoDetectUI.Value))
+            {
+                if (dedicatedUICamera == null)
+                {
+                    var go = new GameObject("UnityRemix_DedicatedUICamera");
+                    UnityEngine.Object.DontDestroyOnLoad(go);
+                    dedicatedUICamera = go.AddComponent<Camera>();
+                    dedicatedUICamera.depth = 100;
+                    dedicatedUICamera.clearFlags = CameraClearFlags.SolidColor;
+                    dedicatedUICamera.backgroundColor = new Color(0, 0, 0, 0);
+                    dedicatedUICamera.nearClipPlane = 0.1f;
+                    dedicatedUICamera.farClipPlane = 1000f;
+                    dedicatedUICamera.cullingMask = uiLayerBit | 1; // UI + Default
+                    logger?.LogInfo("[RemixUIDetector] Created dedicated UI camera for scenes without a native UI camera.");
+                }
+                dedicatedUICamera.enabled = true;
+                uiCameras.Add(dedicatedUICamera);
+            }
+            else if (dedicatedUICamera != null)
+            {
+                dedicatedUICamera.enabled = false;
+            }
+
             // Order UI cameras ascending by depth so they render in natural sequence
             uiCameras.Sort((a, b) => a.depth.CompareTo(b.depth));
             logger?.LogInfo($"[RemixUIDetector] Scan complete: {worldCameras.Count} World Cameras, {uiCameras.Count} UI Cameras detected.");
         }
+
+        private Camera dedicatedUICamera;
 
         /// <summary>
         /// Routes ScreenSpaceOverlay Canvases to render through the primary UI camera in ScreenSpaceCamera mode
@@ -263,18 +289,29 @@ namespace UnityRemix
 
                     canvas.renderMode = RenderMode.ScreenSpaceCamera;
                     canvas.worldCamera = uiCamera;
-                    canvas.planeDistance = Mathf.Clamp(uiCamera.nearClipPlane + 0.1f, 0.1f, 100f);
 
-                    // Ensure camera culling mask includes canvas layer so it is actually rendered
-                    int canvasLayerBit = 1 << canvas.gameObject.layer;
-                    if ((uiCamera.cullingMask & canvasLayerBit) == 0)
+                    // Ensure plane distance is at standard healthy distance (not pressed against near clip)
+                    if (canvas.planeDistance < 10.0f || canvas.planeDistance > 500.0f)
                     {
-                        uiCamera.cullingMask |= canvasLayerBit;
-                        logger?.LogInfo($"[RemixUIDetector] Added layer {LayerMask.LayerToName(canvas.gameObject.layer)}({canvas.gameObject.layer}) to UI camera '{uiCamera.name}' culling mask");
+                        canvas.planeDistance = 100.0f;
                     }
 
-                    logger?.LogInfo($"[RemixUIDetector] Routed Overlay Canvas '{canvas.name}' to ScreenSpaceCamera (cam: '{uiCamera.name}', planeDist: {canvas.planeDistance:F2}, layer: {canvas.gameObject.layer})");
+                    // Recursively ensure all layers used by the canvas and its UI elements are in camera culling mask
+                    IncludeCanvasLayers(uiCamera, canvas.gameObject);
+
+                    logger?.LogInfo($"[RemixUIDetector] Routed Overlay Canvas '{canvas.name}' to ScreenSpaceCamera (cam: '{uiCamera.name}', planeDist: {canvas.planeDistance:F2}, mask: 0x{uiCamera.cullingMask:X})");
                 }
+            }
+        }
+
+        private static void IncludeCanvasLayers(Camera cam, GameObject root)
+        {
+            if (cam == null || root == null) return;
+            cam.cullingMask |= (1 << root.layer);
+            var transforms = root.GetComponentsInChildren<Transform>(true);
+            for (int i = 0; i < transforms.Length; i++)
+            {
+                cam.cullingMask |= (1 << transforms[i].gameObject.layer);
             }
         }
 

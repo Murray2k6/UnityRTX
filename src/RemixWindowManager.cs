@@ -518,7 +518,7 @@ namespace UnityRemix
                 // Hidden off-screen window for headless presentation
                 posX = -32000;
                 posY = -32000;
-                dwStyle = WS_POPUP;
+                dwStyle = WS_POPUP | WS_VISIBLE;
                 dwExStyle = WS_EX_TOOLWINDOW;
                 parentHwnd = IntPtr.Zero;
             }
