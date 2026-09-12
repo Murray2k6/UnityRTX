@@ -248,7 +248,9 @@ namespace UnityRemix
                     dedicatedUICamera.backgroundColor = new Color(0, 0, 0, 0);
                     dedicatedUICamera.nearClipPlane = 0.1f;
                     dedicatedUICamera.farClipPlane = 1000f;
-                    dedicatedUICamera.cullingMask = uiLayerBit | 1; // UI + Default
+                    int alwaysOnTopLayer = LayerMask.NameToLayer("AlwaysOnTop");
+                    int alwaysOnTopBit = alwaysOnTopLayer >= 0 ? (1 << alwaysOnTopLayer) : (1 << 13);
+                    dedicatedUICamera.cullingMask = uiLayerBit | alwaysOnTopBit; // UI + AlwaysOnTop (never Default)
                     logger?.LogInfo("[RemixUIDetector] Created dedicated UI camera for scenes without a native UI camera.");
                 }
                 dedicatedUICamera.enabled = true;
@@ -257,6 +259,15 @@ namespace UnityRemix
             else if (dedicatedUICamera != null)
             {
                 dedicatedUICamera.enabled = false;
+            }
+
+            // Strictly strip layer 0 (Default) from all UI cameras to guarantee they never render the 3D game level
+            foreach (var cam in uiCameras)
+            {
+                if (cam != null)
+                {
+                    cam.cullingMask &= ~1;
+                }
             }
 
             // Order UI cameras ascending by depth so they render in natural sequence
@@ -279,6 +290,12 @@ namespace UnityRemix
             {
                 if (canvas == null) continue;
 
+                // Skip loading blockers whose sole purpose is full-screen blackout during load transitions
+                if (canvas.name.Equals("Loading Blocker", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
                 bool isOverlay = canvas.renderMode == RenderMode.ScreenSpaceOverlay;
                 bool needsRebinding = canvas.renderMode == RenderMode.ScreenSpaceCamera && 
                     (canvas.worldCamera == null || (dedicatedUICamera != null && canvas.worldCamera == dedicatedUICamera && uiCamera != dedicatedUICamera));
@@ -300,23 +317,39 @@ namespace UnityRemix
                         canvas.planeDistance = 100.0f;
                     }
 
-                    // Recursively ensure all layers used by the canvas and its UI elements are in camera culling mask
-                    IncludeCanvasLayers(uiCamera, canvas.gameObject);
+                    // Recursively ensure canvas elements are on UI layers and camera culls them (never layer 0)
+                    SanitizeAndIncludeCanvasLayers(uiCamera, canvas.gameObject);
 
                     logger?.LogInfo($"[RemixUIDetector] Routed Overlay Canvas '{canvas.name}' to ScreenSpaceCamera (cam: '{uiCamera.name}', planeDist: {canvas.planeDistance:F2}, mask: 0x{uiCamera.cullingMask:X})");
                 }
             }
         }
 
-        private static void IncludeCanvasLayers(Camera cam, GameObject root)
+        private static void SanitizeAndIncludeCanvasLayers(Camera cam, GameObject root)
         {
             if (cam == null || root == null) return;
-            cam.cullingMask |= (1 << root.layer);
+            int uiLayer = LayerMask.NameToLayer("UI");
+            if (uiLayer < 0) uiLayer = 5;
+
             var transforms = root.GetComponentsInChildren<Transform>(true);
             for (int i = 0; i < transforms.Length; i++)
             {
-                cam.cullingMask |= (1 << transforms[i].gameObject.layer);
+                var go = transforms[i].gameObject;
+                // If a UI element inside a Canvas was on layer 0 (Default), reassign it to UI layer.
+                // Developers frequently leave Canvas elements on Default because ScreenSpaceOverlay
+                // ignores layers. But if a UI camera culls Default layer, it renders the 3D level!
+                if (go.layer == 0)
+                {
+                    go.layer = uiLayer;
+                }
+                if (go.layer != 0)
+                {
+                    cam.cullingMask |= (1 << go.layer);
+                }
             }
+
+            // Strictly ensure layer 0 (Default) is NEVER in the UI camera's culling mask
+            cam.cullingMask &= ~1;
         }
 
         /// <summary>

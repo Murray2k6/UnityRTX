@@ -205,6 +205,7 @@ namespace UnityRemix
                 cam.SetTargetBuffers(uiRenderTexture.colorBuffer, uiRenderTexture.depthBuffer);
                 cam.clearFlags = CameraClearFlags.SolidColor;
                 cam.backgroundColor = new Color(0, 0, 0, 0);
+                cam.cullingMask &= ~1;
             }
         }
 
@@ -377,15 +378,20 @@ namespace UnityRemix
                         byte b = s[2];
                         byte a = s[3];
 
-                        if (a > 0 || r > 0 || g > 0 || b > 0) nonZeroPixelCount++;
-
                         // Fallback for additive / unlit UI shaders that output color with a == 0
                         byte effA = a;
                         if (effA == 0 && (r > 0 || g > 0 || b > 0))
                         {
                             effA = (byte)Math.Max(r, Math.Max(g, b));
                         }
+                        // Pitch black with a == 255 in an overlay context is an opaque blackout quad or background fill.
+                        // Treat as transparent so the 3D raytraced world shows through cleanly behind the UI.
+                        else if (effA == 255 && r == 0 && g == 0 && b == 0)
+                        {
+                            effA = 0;
+                        }
 
+                        if (effA > 0 || r > 0 || g > 0 || b > 0) nonZeroPixelCount++;
                         if (effA > maxA) maxA = effA;
                         if (effA > 200) opaquePixelCount++;
 
@@ -551,7 +557,7 @@ namespace UnityRemix
                 var bmi = new BITMAPINFO();
                 bmi.bmiHeader.biSize = (uint)Marshal.SizeOf<BITMAPINFOHEADER>();
                 bmi.bmiHeader.biWidth = width;
-                bmi.bmiHeader.biHeight = -height; // Top-down DIB
+                bmi.bmiHeader.biHeight = height; // Bottom-up DIB (matches Unity Texture2D.ReadPixels row 0 at bottom)
                 bmi.bmiHeader.biPlanes = 1;
                 bmi.bmiHeader.biBitCount = 32;
                 bmi.bmiHeader.biCompression = 0; // BI_RGB
@@ -680,6 +686,7 @@ namespace UnityRemix
                 cam.SetTargetBuffers(targetTexture.colorBuffer, targetTexture.depthBuffer);
                 cam.clearFlags = clearFlags;
                 cam.backgroundColor = backgroundColor;
+                cam.cullingMask &= ~1; // Ensure layer 0 (Default / 3D game scene) is never rendered by UI camera
             }
         }
 
