@@ -1,5 +1,7 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using UnityEngine;
@@ -13,64 +15,114 @@ namespace UnityRemix
     }
 
     /// <summary>
-    /// Manages Unity in-engine rendering suppression and API-agnostic framebuffer presentation
-    /// for Single Window mode.
+    /// Coordinates Single-Window mode presentation and in-engine rendering suppression.
+    /// Uses RemixUIDetector to automatically preserve and render UI/HUD cameras and Canvases on top
+    /// of the RTX Remix ray-traced viewport.
     /// </summary>
     public class RemixFramebufferPresenter : MonoBehaviour
     {
         private ManualLogSource logger;
         private RemixWindowManager windowManager;
+        private RemixCameraHandler cameraHandler;
+        private RemixUIDetector uiDetector;
+        private RemixUIOverlay uiOverlay;
+
+        // Config entries
         private ConfigEntry<bool> configSingleWindow;
         private ConfigEntry<SingleWindowMethod> configSingleWindowMethod;
         private ConfigEntry<bool> configDisableInEngineRendering;
+        private ConfigEntry<bool> configAutoDetectUI;
+        private ConfigEntry<string> configUICameraNames;
+        private ConfigEntry<bool> configSingleWindowUIOverlay;
 
-        // Tracking camera states for in-engine rendering suppression
+        // Tracking suppressed world cameras
         private readonly Dictionary<Camera, int> originalCullingMasks = new Dictionary<Camera, int>();
         private readonly Dictionary<Camera, CameraClearFlags> originalClearFlags = new Dictionary<Camera, CameraClearFlags>();
         private bool inEngineRenderingSuppressed = false;
 
-        // Framebuffer copy mode state
-        private Texture2D copyTexture;
-        private byte[] pixelBuffer;
-        private int lastWidth = 0;
-        private int lastHeight = 0;
+        // Copy mode blitter reference
+        private RemixCameraBlitter currentCameraBlitter;
+        private Coroutine overlayCoroutine;
+
+        public RemixUIDetector UIDetector => uiDetector;
 
         public void Initialize(
             ManualLogSource logger,
             RemixWindowManager windowManager,
+            RemixCameraHandler cameraHandler,
             ConfigEntry<bool> singleWindow,
             ConfigEntry<SingleWindowMethod> singleWindowMethod,
-            ConfigEntry<bool> disableInEngineRendering)
+            ConfigEntry<bool> disableInEngineRendering,
+            ConfigEntry<bool> autoDetectUI,
+            ConfigEntry<string> uiCameraNames,
+            ConfigEntry<bool> singleWindowUIOverlay)
         {
             this.logger = logger;
             this.windowManager = windowManager;
+            this.cameraHandler = cameraHandler;
             this.configSingleWindow = singleWindow;
             this.configSingleWindowMethod = singleWindowMethod;
             this.configDisableInEngineRendering = disableInEngineRendering;
+            this.configAutoDetectUI = autoDetectUI;
+            this.configUICameraNames = uiCameraNames;
+            this.configSingleWindowUIOverlay = singleWindowUIOverlay;
 
-            logger?.LogInfo($"[RemixFramebufferPresenter] Initialized (SingleWindow: {singleWindow.Value}, Method: {singleWindowMethod.Value}, SuppressInEngine: {disableInEngineRendering.Value})");
+            uiDetector = new RemixUIDetector(
+                logger,
+                autoDetectUI,
+                uiCameraNames,
+                null
+            );
+
+            logger?.LogInfo($"[RemixFramebufferPresenter] Initialized (SingleWindow: {singleWindow.Value}, Method: {singleWindowMethod.Value}, SuppressInEngine: {disableInEngineRendering.Value}, AutoDetectUI: {autoDetectUI.Value})");
+        }
+
+        void OnEnable()
+        {
+            UnityEngine.SceneManagement.SceneManager.sceneLoaded += OnSceneLoaded;
+        }
+
+        void OnDisable()
+        {
+            UnityEngine.SceneManagement.SceneManager.sceneLoaded -= OnSceneLoaded;
+            Cleanup();
+        }
+
+        private void OnSceneLoaded(UnityEngine.SceneManagement.Scene scene, UnityEngine.SceneManagement.LoadSceneMode mode)
+        {
+            if (configSingleWindow != null && configSingleWindow.Value)
+            {
+                // Re-evaluate suppression and UI detection on scene change
+                StartCoroutine(DeferredSceneSetup());
+            }
+        }
+
+        private IEnumerator DeferredSceneSetup()
+        {
+            yield return null; // Wait one frame for game to instantiate all scene cameras and canvases
+            if (configSingleWindow != null && configSingleWindow.Value && configDisableInEngineRendering.Value)
+            {
+                ApplyInEngineRenderingSuppression();
+            }
         }
 
         void LateUpdate()
         {
             if (configSingleWindow == null) return;
 
-            bool shouldSuppress = configSingleWindow.Value && configDisableInEngineRendering.Value;
+            bool isSingle = configSingleWindow.Value;
+            bool shouldSuppress = isSingle && configDisableInEngineRendering.Value;
 
             if (shouldSuppress != inEngineRenderingSuppressed)
             {
                 if (shouldSuppress)
-                {
                     ApplyInEngineRenderingSuppression();
-                }
                 else
-                {
                     RestoreInEngineRendering();
-                }
             }
 
-            // Sync window bounds if embedded
-            if (configSingleWindow.Value && configSingleWindowMethod.Value == SingleWindowMethod.Embedded && windowManager != null)
+            // Sync embedded window bounds
+            if (isSingle && configSingleWindowMethod.Value == SingleWindowMethod.Embedded && windowManager != null)
             {
                 windowManager.SyncWindowBounds();
             }
@@ -85,26 +137,20 @@ namespace UnityRemix
         }
 
         /// <summary>
-        /// Suppresses Unity's 3D scene rendering so the engine does not perform duplicate
-        /// rasterization passes while RTX Remix is rendering the path-traced scene.
-        /// Player movement, physics, animations, and scripts continue running untouched.
+        /// Suppresses Unity's 3D scene rasterization passes on World Cameras while keeping UI/HUD cameras active.
         /// </summary>
         public void ApplyInEngineRenderingSuppression()
         {
-            var cameras = Camera.allCameras;
-            int suppressedCount = 0;
+            if (uiDetector == null) return;
 
-            foreach (var cam in cameras)
+            Camera worldCam = cameraHandler?.CurrentCamera ?? Camera.main;
+            uiDetector.Refresh(worldCam);
+
+            // Suppress 3D World Cameras
+            int suppressedCount = 0;
+            foreach (var cam in uiDetector.WorldCameras)
             {
                 if (cam == null) continue;
-
-                // Don't suppress UI-only cameras (e.g. HUD camera) if any exist
-                string camName = cam.name.ToLowerInvariant();
-                bool isHudCamera = camName.Contains("hud") || camName.Contains("ui");
-                if (isHudCamera && configSingleWindowMethod.Value == SingleWindowMethod.Copy)
-                {
-                    continue;
-                }
 
                 if (!originalCullingMasks.ContainsKey(cam))
                 {
@@ -112,14 +158,84 @@ namespace UnityRemix
                     originalClearFlags[cam] = cam.clearFlags;
                 }
 
-                // Set cullingMask to 0 so Unity skips all scene geometry, shadow passes, and lighting
                 cam.cullingMask = 0;
                 cam.clearFlags = CameraClearFlags.Nothing;
                 suppressedCount++;
             }
 
+            logger?.LogInfo($"[RemixFramebufferPresenter] In-engine 3D rendering suppressed on {suppressedCount} World Cameras.");
+
+            // Setup UI Presentation depending on single-window method
+            if (configSingleWindowMethod.Value == SingleWindowMethod.Embedded)
+            {
+                SetupEmbeddedUIOverlay();
+            }
+            else if (configSingleWindowMethod.Value == SingleWindowMethod.Copy)
+            {
+                SetupCopyModeBlitter(worldCam);
+            }
+
             inEngineRenderingSuppressed = true;
-            logger?.LogInfo($"[RemixFramebufferPresenter] In-engine 3D rendering suppressed on {suppressedCount} cameras.");
+        }
+
+        private void SetupEmbeddedUIOverlay()
+        {
+            if (configSingleWindowUIOverlay == null || !configSingleWindowUIOverlay.Value)
+                return;
+
+            IntPtr gameWnd = windowManager != null && windowManager.GameWindow != IntPtr.Zero 
+                ? windowManager.GameWindow 
+                : RemixWindowManager.FindGameWindow();
+
+            if (uiOverlay == null && gameWnd != IntPtr.Zero)
+            {
+                uiOverlay = new RemixUIOverlay(logger, gameWnd);
+                if (!uiOverlay.Initialize())
+                {
+                    uiOverlay = null;
+                    return;
+                }
+            }
+
+            if (uiOverlay != null && uiDetector.UICameras.Count > 0)
+            {
+                uiOverlay.ConfigureUICameras(uiDetector.UICameras);
+                uiDetector.RouteOverlayCanvasesToCamera(uiDetector.UICameras[0]);
+
+                if (overlayCoroutine == null)
+                {
+                    overlayCoroutine = StartCoroutine(EndOfFrameOverlayPump());
+                }
+            }
+        }
+
+        private IEnumerator EndOfFrameOverlayPump()
+        {
+            var wait = new WaitForEndOfFrame();
+            while (true)
+            {
+                yield return wait;
+                if (uiOverlay != null && configSingleWindow != null && configSingleWindow.Value &&
+                    configSingleWindowMethod.Value == SingleWindowMethod.Embedded)
+                {
+                    uiOverlay.UpdateOverlay();
+                }
+            }
+        }
+
+        private void SetupCopyModeBlitter(Camera worldCam)
+        {
+            if (worldCam == null) worldCam = Camera.main;
+            if (worldCam == null) return;
+
+            currentCameraBlitter = worldCam.GetComponent<RemixCameraBlitter>();
+            if (currentCameraBlitter == null)
+            {
+                currentCameraBlitter = worldCam.gameObject.AddComponent<RemixCameraBlitter>();
+            }
+
+            currentCameraBlitter.Initialize(windowManager, logger);
+            currentCameraBlitter.SetBlitEnabled(true);
         }
 
         /// <summary>
@@ -127,6 +243,26 @@ namespace UnityRemix
         /// </summary>
         public void RestoreInEngineRendering()
         {
+            if (overlayCoroutine != null)
+            {
+                StopCoroutine(overlayCoroutine);
+                overlayCoroutine = null;
+            }
+
+            if (uiOverlay != null)
+            {
+                uiOverlay.RestoreUICameras();
+                uiOverlay.Destroy();
+                uiOverlay = null;
+            }
+
+            uiDetector?.RestoreCanvases();
+
+            if (currentCameraBlitter != null)
+            {
+                currentCameraBlitter.SetBlitEnabled(false);
+            }
+
             foreach (var kvp in originalCullingMasks)
             {
                 var cam = kvp.Key;
@@ -146,48 +282,14 @@ namespace UnityRemix
             logger?.LogInfo("[RemixFramebufferPresenter] Restored in-engine camera rendering.");
         }
 
-        /// <summary>
-        /// Framebuffer Copy mode: Blits the captured Remix framebuffer directly onto the screen.
-        /// Engine-level and API-agnostic (works on DirectX 11, DirectX 12, Vulkan, OpenGL).
-        /// </summary>
-        void OnRenderImage(RenderTexture src, RenderTexture dest)
+        private void Cleanup()
         {
-            if (configSingleWindow != null && configSingleWindow.Value &&
-                configSingleWindowMethod != null && configSingleWindowMethod.Value == SingleWindowMethod.Copy &&
-                windowManager != null)
-            {
-                int width = Screen.width > 0 ? Screen.width : 1920;
-                int height = Screen.height > 0 ? Screen.height : 1080;
-
-                if (copyTexture == null || lastWidth != width || lastHeight != height)
-                {
-                    if (copyTexture != null) Destroy(copyTexture);
-                    copyTexture = new Texture2D(width, height, TextureFormat.BGRA32, false);
-                    pixelBuffer = new byte[width * height * 4];
-                    lastWidth = width;
-                    lastHeight = height;
-                }
-
-                if (windowManager.CaptureRemixFramebuffer(pixelBuffer, width, height))
-                {
-                    copyTexture.LoadRawTextureData(pixelBuffer);
-                    copyTexture.Apply(false, false);
-                    Graphics.Blit(copyTexture, dest);
-                    return;
-                }
-            }
-
-            Graphics.Blit(src, dest);
+            RestoreInEngineRendering();
         }
 
         void OnDestroy()
         {
-            RestoreInEngineRendering();
-            if (copyTexture != null)
-            {
-                Destroy(copyTexture);
-                copyTexture = null;
-            }
+            Cleanup();
         }
     }
 }
