@@ -2,6 +2,7 @@ using System;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
+using HarmonyLib;
 using UnityEngine;
 
 namespace UnityRemix
@@ -88,6 +89,18 @@ namespace UnityRemix
             // Subscribe to scene events
             UnityEngine.SceneManagement.SceneManager.sceneLoaded += OnSceneLoaded;
             
+            // Apply Harmony patches (e.g. non-readable mesh access, dynamic object spawn hooks)
+            try
+            {
+                var harmony = new Harmony(PluginGUID);
+                MeshAccessPatch.Apply(harmony);
+                DynamicSpawnPatch.Apply(harmony, LogSource);
+            }
+            catch (Exception ex)
+            {
+                LogSource.LogError($"Failed to apply Harmony patches: {ex}");
+            }
+            
             // Load Remix API
             try
             {
@@ -126,7 +139,7 @@ namespace UnityRemix
             configUseVisibilityCulling = Config.Bind("Rendering", "UseVisibilityCulling", false,
                 "Use Unity's renderer.isVisible check to filter out invisible renderers. May cause visual issues in some games - disable if you see missing geometry.");
             
-            configRendererCacheDuration = Config.Bind("Performance", "RendererCacheDuration", 60,
+            configRendererCacheDuration = Config.Bind("Performance", "RendererCacheDuration", 300,
                 new ConfigDescription("Number of frames to cache renderer list before refreshing.",
                     new AcceptableValueRange<int>(10, 3600)));
             

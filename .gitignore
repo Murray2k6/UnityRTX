@@ -47,6 +47,8 @@ bld/
 *.pidb
 *.svclog
 *.scc
+scratch/
+
 
 # ReSharper
 _ReSharper*/
