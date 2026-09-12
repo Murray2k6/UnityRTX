@@ -38,9 +38,37 @@ namespace UnityRemix
         public static bool IsRemixUIOpen => isRemixUIOpen;
         public static void SetRemixUIOpen(bool open) => isRemixUIOpen = open;
         public static void ToggleRemixUI() => isRemixUIOpen = !isRemixUIOpen;
+
+        public void HandleAltX()
+        {
+            ToggleRemixUI();
+            if (remixWindow != IntPtr.Zero)
+            {
+                PostMessage(remixWindow, WM_SYSKEYDOWN, (IntPtr)0x58 /* VK_X */, (IntPtr)0x20000001);
+                PostMessage(remixWindow, WM_SYSKEYUP, (IntPtr)0x58 /* VK_X */, (IntPtr)0x20000001);
+
+                if (isRemixUIOpen)
+                {
+                    SetFocus(remixWindow);
+                }
+                else if (gameWindow != IntPtr.Zero)
+                {
+                    SetFocus(gameWindow);
+                }
+            }
+        }
         
         #region Win32 API Declarations
         
+        [DllImport("user32.dll")]
+        private static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetFocus(IntPtr hWnd);
+
+        private const uint WM_SYSKEYDOWN = 0x0104;
+        private const uint WM_SYSKEYUP = 0x0105;
+
         [DllImport("user32.dll")]
         private static extern IntPtr GetActiveWindow();
         

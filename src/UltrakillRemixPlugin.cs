@@ -218,6 +218,8 @@ namespace UnityRemix
         {
             LogSource.LogInfo($"Scene loaded: {scene.name}, mode: {mode}");
             
+            framebufferPresenter?.OnSceneLoaded(scene);
+
             // Reset camera tracking
             cameraHandler?.ResetTracking();
             
@@ -311,7 +313,7 @@ namespace UnityRemix
                 remixInterface
             );
 
-            framebufferPresenter = gameObject.AddComponent<RemixFramebufferPresenter>();
+            framebufferPresenter = new RemixFramebufferPresenter();
             framebufferPresenter.Initialize(
                 LogSource,
                 windowManager,
@@ -540,8 +542,16 @@ namespace UnityRemix
                 renderThread.UpdateFrameState(nextState);
             }
 
+            // Update SingleWindow framebuffer presenter & UI overlay
+            framebufferPresenter?.Update(frameCount);
+
             // Update debug HUD snapshot after all frame data is captured
             debugHUD?.UpdateSnapshot();
+        }
+
+        public void OnEndOfFrame()
+        {
+            framebufferPresenter?.OnEndOfFrame();
         }
         
         void OnDestroy()
@@ -583,6 +593,7 @@ namespace UnityRemix
             renderThread?.Stop();
             
             // Cleanup all components
+            framebufferPresenter?.Cleanup();
             materialManager?.Cleanup();
             meshConverter?.Cleanup();
             frameCapture?.Cleanup();

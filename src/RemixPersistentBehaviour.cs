@@ -15,6 +15,20 @@ namespace UnityRemix
         {
             plugin = sourcePlugin;
             LogSource.LogInfo("RemixPersistentBehaviour initialized");
+            StartCoroutine(EndOfFrameLoop());
+        }
+
+        private System.Collections.IEnumerator EndOfFrameLoop()
+        {
+            var wait = new WaitForEndOfFrame();
+            while (true)
+            {
+                yield return wait;
+                if ((object)plugin != null)
+                {
+                    plugin.OnEndOfFrame();
+                }
+            }
         }
         
         void LateUpdate()

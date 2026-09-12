@@ -1,5 +1,4 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using BepInEx.Configuration;
@@ -19,7 +18,7 @@ namespace UnityRemix
     /// Uses RemixUIDetector to automatically preserve and render UI/HUD cameras and Canvases on top
     /// of the RTX Remix ray-traced viewport.
     /// </summary>
-    public class RemixFramebufferPresenter : MonoBehaviour
+    public class RemixFramebufferPresenter
     {
         private ManualLogSource logger;
         private RemixWindowManager windowManager;
@@ -39,10 +38,10 @@ namespace UnityRemix
         private readonly Dictionary<Camera, int> originalCullingMasks = new Dictionary<Camera, int>();
         private readonly Dictionary<Camera, CameraClearFlags> originalClearFlags = new Dictionary<Camera, CameraClearFlags>();
         private bool inEngineRenderingSuppressed = false;
+        private int sceneRefreshCounter = 0;
 
         // Copy mode blitter reference
         private RemixCameraBlitter currentCameraBlitter;
-        private Coroutine overlayCoroutine;
 
         public RemixUIDetector UIDetector => uiDetector;
 
@@ -77,44 +76,22 @@ namespace UnityRemix
             logger?.LogInfo($"[RemixFramebufferPresenter] Initialized (SingleWindow: {singleWindow.Value}, Method: {singleWindowMethod.Value}, SuppressInEngine: {disableInEngineRendering.Value}, AutoDetectUI: {autoDetectUI.Value})");
         }
 
-        void OnEnable()
+        public void OnSceneLoaded(UnityEngine.SceneManagement.Scene scene)
         {
-            UnityEngine.SceneManagement.SceneManager.sceneLoaded += OnSceneLoaded;
+            sceneRefreshCounter = 5; // Re-evaluate suppression on the next 5 frames to catch async objects
         }
 
-        void OnDisable()
-        {
-            UnityEngine.SceneManagement.SceneManager.sceneLoaded -= OnSceneLoaded;
-            Cleanup();
-        }
-
-        private void OnSceneLoaded(UnityEngine.SceneManagement.Scene scene, UnityEngine.SceneManagement.LoadSceneMode mode)
-        {
-            if (configSingleWindow != null && configSingleWindow.Value)
-            {
-                // Re-evaluate suppression and UI detection on scene change
-                StartCoroutine(DeferredSceneSetup());
-            }
-        }
-
-        private IEnumerator DeferredSceneSetup()
-        {
-            yield return null; // Wait one frame for game to instantiate all scene cameras and canvases
-            if (configSingleWindow != null && configSingleWindow.Value && configDisableInEngineRendering.Value)
-            {
-                ApplyInEngineRenderingSuppression();
-            }
-        }
-
-        void LateUpdate()
+        public void Update(int frameCount)
         {
             if (configSingleWindow == null) return;
 
             bool isSingle = configSingleWindow.Value;
             bool shouldSuppress = isSingle && configDisableInEngineRendering.Value;
 
-            if (shouldSuppress != inEngineRenderingSuppressed)
+            if (shouldSuppress != inEngineRenderingSuppressed || sceneRefreshCounter > 0)
             {
+                if (sceneRefreshCounter > 0) sceneRefreshCounter--;
+
                 if (shouldSuppress)
                     ApplyInEngineRenderingSuppression();
                 else
@@ -127,12 +104,22 @@ namespace UnityRemix
                 windowManager.SyncWindowBounds();
             }
 
-            // Handle Alt+X detection for Remix ImGui mouse unlock
+            // Handle Alt+X detection for Remix ImGui
             bool altPressed = Input.GetKey(KeyCode.LeftAlt) || Input.GetKey(KeyCode.RightAlt);
             if (altPressed && Input.GetKeyDown(KeyCode.X))
             {
-                RemixWindowManager.ToggleRemixUI();
-                logger?.LogInfo($"[RemixFramebufferPresenter] Alt+X toggled, RemixUIOpen: {RemixWindowManager.IsRemixUIOpen}");
+                windowManager?.HandleAltX();
+                logger?.LogInfo($"[RemixFramebufferPresenter] Alt+X pressed, RemixUIOpen: {RemixWindowManager.IsRemixUIOpen}");
+            }
+        }
+
+        public void OnEndOfFrame()
+        {
+            if (configSingleWindow != null && configSingleWindow.Value &&
+                configSingleWindowMethod.Value == SingleWindowMethod.Embedded &&
+                uiOverlay != null)
+            {
+                uiOverlay.UpdateOverlay();
             }
         }
 
@@ -201,25 +188,6 @@ namespace UnityRemix
             {
                 uiOverlay.ConfigureUICameras(uiDetector.UICameras);
                 uiDetector.RouteOverlayCanvasesToCamera(uiDetector.UICameras[0]);
-
-                if (overlayCoroutine == null)
-                {
-                    overlayCoroutine = StartCoroutine(EndOfFrameOverlayPump());
-                }
-            }
-        }
-
-        private IEnumerator EndOfFrameOverlayPump()
-        {
-            var wait = new WaitForEndOfFrame();
-            while (true)
-            {
-                yield return wait;
-                if (uiOverlay != null && configSingleWindow != null && configSingleWindow.Value &&
-                    configSingleWindowMethod.Value == SingleWindowMethod.Embedded)
-                {
-                    uiOverlay.UpdateOverlay();
-                }
             }
         }
 
@@ -243,12 +211,6 @@ namespace UnityRemix
         /// </summary>
         public void RestoreInEngineRendering()
         {
-            if (overlayCoroutine != null)
-            {
-                StopCoroutine(overlayCoroutine);
-                overlayCoroutine = null;
-            }
-
             if (uiOverlay != null)
             {
                 uiOverlay.RestoreUICameras();
@@ -282,14 +244,9 @@ namespace UnityRemix
             logger?.LogInfo("[RemixFramebufferPresenter] Restored in-engine camera rendering.");
         }
 
-        private void Cleanup()
+        public void Cleanup()
         {
             RestoreInEngineRendering();
-        }
-
-        void OnDestroy()
-        {
-            Cleanup();
         }
     }
 }
