@@ -62,4 +62,11 @@ $missingInterop = New-Game 'Missing interop' BepInEx6IL2CPP
 Assert-Throws { & (Join-Path $PSScriptRoot '../setup-references.ps1') -UnityPath $missingInterop } '*launch the game*'
 Assert-Equal (Get-UnityRemixTargetFramework BepInEx5Mono) netstandard2.1 'Mono target framework'
 Assert-Equal (Get-UnityRemixTargetFramework BepInEx6IL2CPP) net6.0 'IL2CPP target framework'
+foreach ($runtime in @('BepInEx5Mono','BepInEx6Mono','BepInEx6IL2CPP')) {
+    $shadowed = New-Game "Shadowed engine $runtime" $runtime
+    Set-Content -LiteralPath (Join-Path $shadowed 'BepInEx/core/UnityEngine.CoreModule.dll') -Value 'reference copy from another Unity version'
+    Assert-Throws { Get-UnityRemixLayout $shadowed } '*reference DLLs*shadow*'
+    Assert-Throws { Install-UnityRemixPlugin $shadowed $runtime $plugin } '*reference DLLs*shadow*'
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $shadowed 'BepInEx/plugins/UnityRemix.dll')) $false 'Rejected loader must not install a plugin'
+}
 Write-Host "Passed $script:checks runtime and install checks. Fixtures: $root"

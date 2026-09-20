@@ -57,6 +57,12 @@ function Get-UnityRemixLayout {
     $v5 = Test-Path -LiteralPath (Join-Path $core 'BepInEx.dll')
     $v6 = Test-Path -LiteralPath (Join-Path $core 'BepInEx.Core.dll')
     if ($v5 -and $v6) { throw 'Mixed BepInEx 5/6 core assemblies detected. Use a clean installation of one loader.' }
+    # Doorstop searches core before Managed; engine reference copies can replace
+    # the player's own Unity types before BepInEx or this plugin starts.
+    $engineCopies = @(Get-ChildItem -LiteralPath $core -File -Filter 'UnityEngine*.dll')
+    if ($engineCopies.Count) {
+        throw 'Unity engine reference DLLs were found in BepInEx/core. They can shadow the game assemblies and crash Unity before plugin startup. Restore a clean matching BepInEx loader; keep build references in lib, not in the game loader.'
+    }
     if ($il2cpp) {
         if (!$v6 -or !(Test-Path -LiteralPath (Join-Path $core 'BepInEx.Unity.IL2CPP.dll'))) {
             throw 'This game uses IL2CPP and requires BepInEx 6 Unity IL2CPP.'

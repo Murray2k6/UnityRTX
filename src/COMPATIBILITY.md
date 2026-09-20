@@ -429,6 +429,18 @@ A standalone WARP test verifies cross-thread exclusion and release. The game
 was left closed at the user's request, so the latest fix has no live-game
 validation and the device-loss cause is not considered fully established.
 
+## Loader assembly integrity
+
+Keep copied Unity reference assemblies in the project's `lib` directories.
+Placing `UnityEngine*.dll` in `BepInEx/core` can shadow the player's actual
+engine assemblies because Doorstop searches that directory first. PEAK's Unity
+6000.3.15f1 startup log showed missing `RenderPipelineManager` methods followed
+by a native Mono access violation before BepInEx or Remix initialized; its core
+folder contained 83 copied Unity engine DLLs and mixed BepInEx 5/6 assemblies.
+Reference setup and installation now reject Unity engine DLLs in the loader
+core, as well as mixed loader versions. Restore a clean matching loader while
+preserving the game's own assemblies and plugin configuration.
+
 ## Build for a game
 
 Reference preparation supports all four builds. It reads Mono engine assemblies
