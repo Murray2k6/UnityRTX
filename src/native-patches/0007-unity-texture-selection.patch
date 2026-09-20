@@ -1,0 +1,611 @@
+diff --git a/src/dxvk/imgui/dxvk_imgui.cpp b/src/dxvk/imgui/dxvk_imgui.cpp
+index e715f0e..e35d306 100644
+--- a/src/dxvk/imgui/dxvk_imgui.cpp
++++ b/src/dxvk/imgui/dxvk_imgui.cpp
+@@ -680,27 +680,27 @@ namespace dxvk {
+     g_usedFogStateHash = usedFogHash;
+   }
+ 
+-  void ImGUI::wndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+-    // NV-DXVK start: No ImGui calls from Unity's message thread
+-    if (m_hostInput) {
+-      switch (msg) {
+-      case WM_LBUTTONDBLCLK: case WM_RBUTTONDBLCLK: case WM_MBUTTONDBLCLK: case WM_XBUTTONDBLCLK:
+-      case WM_MOUSEMOVE: case WM_LBUTTONDOWN: case WM_LBUTTONUP:
+-      case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+-      case WM_XBUTTONDOWN: case WM_XBUTTONUP: case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
+-      case WM_KEYDOWN: case WM_KEYUP: case WM_SYSKEYDOWN: case WM_SYSKEYUP:
+-      case WM_CHAR: case WM_SETFOCUS: case WM_KILLFOCUS: case WM_MOUSELEAVE: {
+-        std::lock_guard lock(m_hostInputMutex);
+-        if (m_hostMessages.size() < 4096) {
+-          m_hostMessages.push_back(MSG{hWnd, msg, wParam, lParam});
+-        }
+-        break;
+-      }
+-      default: break;
+-      }
+-      return;
+-    }
+-    // NV-DXVK end
++  void ImGUI::wndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
++    // NV-DXVK start: No ImGui calls from Unity's message thread
++    if (m_hostInput) {
++      switch (msg) {
++      case WM_LBUTTONDBLCLK: case WM_RBUTTONDBLCLK: case WM_MBUTTONDBLCLK: case WM_XBUTTONDBLCLK:
++      case WM_MOUSEMOVE: case WM_LBUTTONDOWN: case WM_LBUTTONUP:
++      case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_MBUTTONDOWN: case WM_MBUTTONUP:
++      case WM_XBUTTONDOWN: case WM_XBUTTONUP: case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
++      case WM_KEYDOWN: case WM_KEYUP: case WM_SYSKEYDOWN: case WM_SYSKEYUP:
++      case WM_CHAR: case WM_SETFOCUS: case WM_KILLFOCUS: case WM_MOUSELEAVE: {
++        std::lock_guard lock(m_hostInputMutex);
++        if (m_hostMessages.size() < 4096) {
++          m_hostMessages.push_back(MSG{hWnd, msg, wParam, lParam});
++        }
++        break;
++      }
++      default: break;
++      }
++      return;
++    }
++    // NV-DXVK end
+     fork_hooks::imguiContextPin(m_context, m_plotContext);
+     if (m_overlayWin.ptr() != nullptr) {
+       m_overlayWin->gameWndProcHandler(hWnd, msg, wParam, lParam);
+@@ -961,10 +961,10 @@ namespace dxvk {
+       showReflexLatencyStats();
+     }
+ 
+-    // NV-DXVK start: The Unity host controls cursor visibility on its main thread
+-    if (m_hostInput) {
+-      ImGui::GetIO().MouseDrawCursor = false;
+-    } else if (showUI == UIType::None) {
++    // NV-DXVK start: The Unity host controls cursor visibility on its main thread
++    if (m_hostInput) {
++      ImGui::GetIO().MouseDrawCursor = false;
++    } else if (showUI == UIType::None) {
+       ImGui::CloseCurrentPopup();
+       ImGui::GetIO().MouseDrawCursor = false;
+       // Restore OS cursor visibility (ShowCursor uses a reference counter)
+@@ -978,10 +978,10 @@ namespace dxvk {
+         // Force display counter into visible state
+         while (ShowCursor(TRUE) < 0) {  }
+       }
+-    }
+-
+-    showHudMessages(ctx);
+-    // NV-DXVK end
++    }
++
++    showHudMessages(ctx);
++    // NV-DXVK end
+ 
+ #ifdef REMIX_DEVELOPMENT
+     // Show visual indicator when crash hotkeys are armed (one option arms both CPU and GPU crash hotkeys)
+@@ -2547,12 +2547,26 @@ namespace dxvk {
+     bool clickedOnTextureButton = false;
+     static std::atomic<XXH64_hash_t> g_jumpto {};
+ 
+-    const XXH64_hash_t textureInPopup = texture_popup::g_holdingTexture.load();
++    const XXH64_hash_t textureInPopup = texture_popup::g_holdingTexture.load();
++
++    // NV-DXVK start: Rasterized Unity sky faces have no ray-traced picking ID.
++    if (m_requestUnitySkySelection.exchange(false)) {
++      m_unitySkyTexturesOnly = true;
++      texture_popup::g_openWhenAvailable = false;
++      ImGui::SetScrollY(0);
++    }
++    // NV-DXVK end
+ 
+     auto foundTextureHash = std::optional<XXH64_hash_t> {};
+     auto highlightColor = HighlightColor::World;
+ 
+-    for (auto& [texHash, texImgui] : g_imguiTextureMap) {
++    for (auto& [texHash, texImgui] : g_imguiTextureMap) {
++      // NV-DXVK start: Expose original sky faces, including a painted sun.
++      if (m_unityLegacyTextures && m_unitySkyTexturesOnly &&
++          !RtxOptions::skyBoxTexturesObject().containsHash(texHash)) {
++        continue;
++      }
++      // NV-DXVK end
+       bool textureHasSelection = false;
+ 
+       if (isListFiltered) {
+@@ -2623,10 +2637,15 @@ namespace dxvk {
+       ImGui::SetCursorPosX(x + startX + (thumbnailSize - extent.x) / 2.f);
+       ImGui::SetCursorPosY(y + (thumbnailSize - extent.y) / 2.f);
+ 
+-      if (ImGui::ImageButton(texImgui.texID, extent)) {
+-        clickedOnTextureButton = true;
+-        texture_popup::g_wasLeftClick = true;
+-      }
++      // NV-DXVK start: Unity source textures use bottom-left UVs; native UI does not.
++      const bool flipPreview = m_unityLegacyTextures &&
++        !(texImgui.textureFeatureFlags & kTextureFlagsRenderTarget);
++      if (ImGui::ImageButton(texImgui.texID, extent,
++          ImVec2(0, flipPreview ? 1.f : 0.f), ImVec2(1, flipPreview ? 0.f : 1.f))) {
++        clickedOnTextureButton = true;
++        texture_popup::g_wasLeftClick = true;
++      }
++      // NV-DXVK end
+ 
+       if (!showLegacyTextureGui() || uniqueId == texture_popup::lastOpenCategoryId) {
+         if (g_jumpto.load() == texHash) {
+@@ -2705,7 +2724,7 @@ namespace dxvk {
+           tovec2i(ImGui::GetMousePos()) + Vector2i { 1, 1 },
+ 
+           // and callback on result:
+-          [sceneManager = &common->getSceneManager()](std::vector<ObjectPickingValue>&& objectPickingValues, std::optional<XXH64_hash_t> legacyTextureHash) {
++          [this, unityTextures = m_unityLegacyTextures.load(), sceneManager = &common->getSceneManager()](std::vector<ObjectPickingValue>&& objectPickingValues, std::optional<XXH64_hash_t> legacyTextureHash) {
+             // assert(legacyTextureHash);
+             // found asynchronously the legacy texture hash, place it into texture_popup; so we would highlight it
+             texture_popup::g_holdingTexture.exchange(legacyTextureHash.value_or(kEmptyHash));
+@@ -2715,7 +2734,12 @@ namespace dxvk {
+               meshHash = sceneManager->findMeshHashByObjectPickingValue(objectPickingValue).value_or(kEmptyHash);
+               sceneManager->logMeshHashByObjectPickingValue(objectPickingValue);
+             }
+-            texture_popup::g_holdingMeshHash.exchange(meshHash);
++            texture_popup::g_holdingMeshHash.exchange(meshHash);
++            // NV-DXVK start: Let a sky click reach the original sky texture chooser.
++            if (unityTextures && !legacyTextureHash && meshHash == kEmptyHash) {
++              m_requestUnitySkySelection.store(true);
++            }
++            // NV-DXVK end
+             // move UI menu focus
+             g_jumpto.exchange(legacyTextureHash.value_or(kEmptyHash));
+           });
+@@ -3150,9 +3174,18 @@ namespace dxvk {
+           "Left click to open a category selection window.");
+       }
+ 
+-      spacing();
+-
+-      if (!showLegacyTextureGui()) {
++      spacing();
++
++      // NV-DXVK start: Sky imagery remains selectable without scene geometry.
++      if (m_unityLegacyTextures) {
++        ImGui::Checkbox("Sky and sun textures", &m_unitySkyTexturesOnly);
++        if (m_unitySkyTexturesOnly) {
++          ImGui::TextWrapped("Select the sky image containing the sun. A sun painted into a sky image shares that texture's material.");
++        }
++      }
++      // NV-DXVK end
++
++      if (!showLegacyTextureGui()) {
+         showTextureSelectionGrid(ctx, Uncategorized, numThumbnailsPerRow, thumbnailSize);
+       } else {
+ 
+@@ -4725,40 +4758,40 @@ namespace dxvk {
+       m_init = true;
+     }
+ 
+-    ImGui_ImplDxvk::NewFrame();
+-    // NV-DXVK start: Drain host messages on the thread that owns ImGui
+-    if (m_hostInput) {
+-      std::vector<MSG> messages;
+-      {
+-        std::lock_guard lock(m_hostInputMutex);
+-        messages.swap(m_hostMessages);
+-      }
+-      for (const auto& msg : messages) {
+-        ImGui_ImplWin32_WndProcHandler(msg.hwnd, msg.message, msg.wParam, msg.lParam);
+-      }
+-    }
+-    // NV-DXVK end
+-    ImGui_ImplWin32_NewFrame();
+-
+-    ImGuiIO& io = ImGui::GetIO();
+-    io.DisplaySize = ImVec2((float) surfaceSize.width, (float) surfaceSize.height);
+-    // NV-DXVK start: Unity's main thread owns the OS cursor
+-    if (m_hostInput) {
+-      io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+-    }
+-    // NV-DXVK end
++    ImGui_ImplDxvk::NewFrame();
++    // NV-DXVK start: Drain host messages on the thread that owns ImGui
++    if (m_hostInput) {
++      std::vector<MSG> messages;
++      {
++        std::lock_guard lock(m_hostInputMutex);
++        messages.swap(m_hostMessages);
++      }
++      for (const auto& msg : messages) {
++        ImGui_ImplWin32_WndProcHandler(msg.hwnd, msg.message, msg.wParam, msg.lParam);
++      }
++    }
++    // NV-DXVK end
++    ImGui_ImplWin32_NewFrame();
++
++    ImGuiIO& io = ImGui::GetIO();
++    io.DisplaySize = ImVec2((float) surfaceSize.width, (float) surfaceSize.height);
++    // NV-DXVK start: Unity's main thread owns the OS cursor
++    if (m_hostInput) {
++      io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
++    }
++    // NV-DXVK end
+ 
+     ImGui::NewFrame();
+ 
+-    update(ctx);
+-
+-    // NV-DXVK start: Main-thread cursor and input policy reads an atomic snapshot
+-    if (m_hostInput) {
+-      const bool menu = RtxOptions::showUI() != UIType::None;
+-      m_hostInputState = (menu ? 1u : 0u) |
+-        (menu && RtxOptions::blockInputToGameInUI() ? 2u : 0u);
+-    }
+-    // NV-DXVK end
++    update(ctx);
++
++    // NV-DXVK start: Main-thread cursor and input policy reads an atomic snapshot
++    if (m_hostInput) {
++      const bool menu = RtxOptions::showUI() != UIType::None;
++      m_hostInputState = (menu ? 1u : 0u) |
++        (menu && RtxOptions::blockInputToGameInUI() ? 2u : 0u);
++    }
++    // NV-DXVK end
+ 
+     ImGui_ImplDxvk::RenderDrawData(ImGui::GetDrawData(), ctx.ptr(), surfaceSize.width, surfaceSize.height);
+   }
+@@ -4923,14 +4956,14 @@ namespace dxvk {
+     // When closing the menus, try and free up some extra memory, just in case
+     //  the user has toggled a bunch of systems while in menus causing an artificial
+     //  inflation.
+-    freeUnusedMemory();
+-
+-    // NV-DXVK start: Unity restores its own cursor state
+-    if (m_hostInput) {
+-      return;
+-    }
+-    // NV-DXVK end
+-    ::ShowCursor(m_prevCursorVisible);
++    freeUnusedMemory();
++
++    // NV-DXVK start: Unity restores its own cursor state
++    if (m_hostInput) {
++      return;
++    }
++    // NV-DXVK end
++    ::ShowCursor(m_prevCursorVisible);
+     if (RtxOptions::restoreCursorPosition()) {
+       ::SetPhysicalCursorPos(m_cachedGameCursorX, m_cachedGameCursorY);
+     }
+diff --git a/src/dxvk/imgui/dxvk_imgui.h b/src/dxvk/imgui/dxvk_imgui.h
+index f84c3f4..93f2b8e 100644
+--- a/src/dxvk/imgui/dxvk_imgui.h
++++ b/src/dxvk/imgui/dxvk_imgui.h
+@@ -83,12 +83,14 @@ namespace dxvk {
+      * 
+      * see: https://docs.microsoft.com/en-us/previous-versions/windows/desktop/legacy/ms633573(v=vs.85)
+      */
+-    void wndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+-    // NV-DXVK start: Host input is consumed on the ImGui render thread
+-    void enableHostInput() { m_hostInput = true; }
+-    bool hasHostInput() const { return m_hostInput.load(); }
+-    uint32_t hostInputState() const { return m_hostInputState.load(); }
+-    // NV-DXVK end
++    void wndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
++    // NV-DXVK start: Host input is consumed on the ImGui render thread
++    void enableHostInput() { m_hostInput = true; }
++    bool hasHostInput() const { return m_hostInput.load(); }
++    uint32_t hostInputState() const { return m_hostInputState.load(); }
++    void enableUnityLegacyTextures() { m_unityLegacyTextures = true; }
++    bool usesUnityLegacyTextures() const { return m_unityLegacyTextures.load(); }
++    // NV-DXVK end
+ 
+     /**
+      * \brief Render ImGUI
+@@ -129,13 +131,16 @@ namespace dxvk {
+       }
+     }
+ 
+-  private:
+-    // NV-DXVK start: Host input queue
+-    std::atomic<bool> m_hostInput = {false};
+-    std::atomic<uint32_t> m_hostInputState = {0};
+-    std::mutex m_hostInputMutex;
+-    std::vector<MSG> m_hostMessages;
+-    // NV-DXVK end
++  private:
++    // NV-DXVK start: Host input queue
++    std::atomic<bool> m_hostInput = {false};
++    std::atomic<uint32_t> m_hostInputState = {0};
++    std::mutex m_hostInputMutex;
++    std::vector<MSG> m_hostMessages;
++    std::atomic<bool> m_unityLegacyTextures = {false};
++    bool m_unitySkyTexturesOnly = false;
++    std::atomic<bool> m_requestUnitySkySelection = {false};
++    // NV-DXVK end
+     enum class ShaderMessageType {
+       None,
+       Ok,
+diff --git a/src/dxvk/rtx_render/rtx_remix_api.cpp b/src/dxvk/rtx_render/rtx_remix_api.cpp
+index a35d4f1..0d220ae 100644
+--- a/src/dxvk/rtx_render/rtx_remix_api.cpp
++++ b/src/dxvk/rtx_render/rtx_remix_api.cpp
+@@ -2177,7 +2177,7 @@ namespace {
+         D3DADAPTER_DEFAULT,
+         D3DDEVTYPE_HAL,
+         hwnd,
+-        D3DCREATE_HARDWARE_VERTEXPROCESSING | (info->forceNoVkSwapchain ? D3DCREATE_NOWINDOWCHANGES : 0),
++        D3DCREATE_HARDWARE_VERTEXPROCESSING | (info->forceNoVkSwapchain ? D3DCREATE_NOWINDOWCHANGES : 0),
+         &presInfo,
+         nullptr,
+         &d3d9Device);
+@@ -2201,21 +2201,21 @@ namespace {
+     return REMIXAPI_ERROR_CODE_SUCCESS;
+   }
+ 
+-  remixapi_ErrorCode REMIXAPI_CALL remixapi_Shutdown(void) {
++  remixapi_ErrorCode REMIXAPI_CALL remixapi_Shutdown(void) {
+     // Clear fork-owned callback state (lives in rtx_fork_api_entry.cpp)
+     dxvk::fork_hooks::shutdownCallbacks();
+-    IDirect3DDevice9Ex* retiringDevice = nullptr;
+-    {
+-      std::lock_guard lock { s_mutex };
+-      retiringDevice = s_dxvkDevice;
+-      s_dxvkDevice = nullptr;
++    IDirect3DDevice9Ex* retiringDevice = nullptr;
++    {
++      std::lock_guard lock { s_mutex };
++      retiringDevice = s_dxvkDevice;
++      s_dxvkDevice = nullptr;
+       s_persistentInstances.clear();
+       s_pendingPersistentInstanceUpserts.clear();
+       s_pendingPersistentInstanceDestroys.clear();
+     }
+-    if (retiringDevice) {
+-      while (true) {
+-        ULONG left = retiringDevice->Release();
++    if (retiringDevice) {
++      while (true) {
++        ULONG left = retiringDevice->Release();
+         if (left == 0) {
+           break;
+         }
+@@ -2374,10 +2374,10 @@ namespace {
+       }
+     }
+ 
+-    if (windowWidth > 0 && windowHeight > 0) {
+-      dxvk::Com<IDirect3DSwapChain9> swapchain;
++    if (windowWidth > 0 && windowHeight > 0) {
++      dxvk::Com<IDirect3DSwapChain9> swapchain;
+       hr = remixDevice->GetSwapChain(0, &swapchain);
+-      if (FAILED(hr) || swapchain == nullptr) {
++      if (FAILED(hr) || swapchain == nullptr) {
+         return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+       }
+       D3DPRESENT_PARAMETERS presentParams{};
+@@ -2387,7 +2387,7 @@ namespace {
+       }
+ 
+       // reset swapchain if window has changed
+-      if (presentParams.BackBufferWidth != windowWidth ||
++      if (presentParams.BackBufferWidth != windowWidth ||
+           presentParams.BackBufferHeight != windowHeight) {
+         presentParams.BackBufferWidth = windowWidth;
+         presentParams.BackBufferHeight = windowHeight;
+@@ -2709,20 +2709,32 @@ extern "C"
+     return REMIXAPI_ERROR_CODE_SUCCESS;
+   }
+ 
+-  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_ResetScene(void) {
+-    dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
+-    if (!remixDevice) {
+-      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+-    }
+-    auto devLock = remixDevice->LockDevice();
+-    // Order cache invalidation and GPU idle before subsequent resource destroys.
+-    remixDevice->EmitCs([](dxvk::DxvkContext* ctx) {
+-      ctx->getCommonObjects()->getSceneManager().clear(ctx, true);
+-    });
+-    return REMIXAPI_ERROR_CODE_SUCCESS;
+-  }
+-
+-  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_RegisterCallbacks(
++  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_EnableUnityLegacyTextures(void) {
++    auto device = tryAsDxvk();
++    if (!device) {
++      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
++    }
++    auto devLock = device->LockDevice();
++    device->EmitCs([](dxvk::DxvkContext* ctx) {
++      ctx->getCommonObjects()->getImgui().enableUnityLegacyTextures();
++    });
++    return REMIXAPI_ERROR_CODE_SUCCESS;
++  }
++
++  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_ResetScene(void) {
++    dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
++    if (!remixDevice) {
++      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
++    }
++    auto devLock = remixDevice->LockDevice();
++    // Order cache invalidation and GPU idle before subsequent resource destroys.
++    remixDevice->EmitCs([](dxvk::DxvkContext* ctx) {
++      ctx->getCommonObjects()->getSceneManager().clear(ctx, true);
++    });
++    return REMIXAPI_ERROR_CODE_SUCCESS;
++  }
++
++  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_RegisterCallbacks(
+     PFN_remixapi_BridgeCallback beginSceneCallback,
+     PFN_remixapi_BridgeCallback endSceneCallback,
+     PFN_remixapi_BridgeCallback presentCallback) {
+@@ -2730,91 +2742,91 @@ extern "C"
+     return REMIXAPI_ERROR_CODE_SUCCESS;
+   }
+ 
+-  remixapi_UIState REMIXAPI_CALL remixapi_GetUIState(void) {
++  remixapi_UIState REMIXAPI_CALL remixapi_GetUIState(void) {
+     return dxvk::fork_hooks::getUiState(tryAsDxvk());
+-  }
+-
+-  // Unity's render callback is native-only. It never enters Mono or IL2CPP.
+-  void __stdcall unityRenderEvent(int) {
+-    std::unique_lock lock(s_mutex, std::try_to_lock);
+-    if (!lock) {
+-      return;
+-    }
+-    if (auto device = tryAsDxvk()) {
+-      if (auto presenter = device->GetExternalPresenter()) {
+-        presenter->GetUnityOutput().copyToUnity();
+-      }
+-    }
+-  }
+-
+-  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_EnableUnityOutput(void) {
+-    std::lock_guard lock(s_mutex);
+-    auto device = tryAsDxvk();
+-    if (!device || !device->GetExternalPresenter()) {
+-      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+-    }
+-    device->GetExternalPresenter()->EnableUnityOutput();
+-    device->GetDXVKDevice()->getCommon()->getImgui().enableHostInput();
+-    return REMIXAPI_ERROR_CODE_SUCCESS;
+-  }
+-
+-  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_SetUnityOutputTargets(void* scene, void* gui) {
+-    std::lock_guard lock(s_mutex);
+-    auto device = tryAsDxvk();
+-    if (!device || !device->GetExternalPresenter()) {
+-      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+-    }
+-    HRESULT hr = device->GetExternalPresenter()->GetUnityOutput().setTargets(
+-      static_cast<ID3D11Texture2D*>(scene), static_cast<ID3D11Texture2D*>(gui));
+-    return SUCCEEDED(hr) ? REMIXAPI_ERROR_CODE_SUCCESS : REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+-  }
+-
+-  REMIXAPI void* REMIXAPI_CALL remixapi_GetUnityRenderEvent(void) {
+-    return reinterpret_cast<void*>(&unityRenderEvent);
+-  }
+-
+-  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_AcquireSharedD3D11Frame(
+-      void** scene, void** gui, uint32_t* width, uint32_t* height) {
+-    if (!scene || !gui || !width || !height) {
+-      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+-    }
+-    *scene = *gui = nullptr;
+-    *width = *height = 0;
+-    std::lock_guard lock(s_mutex);
+-    auto device = tryAsDxvk();
+-    if (!device || !device->GetExternalPresenter()) {
+-      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+-    }
+-    auto presenter = device->GetExternalPresenter();
+-    presenter->EnableUnityOutput();
+-    device->GetDXVKDevice()->getCommon()->getImgui().enableHostInput();
+-    D3DPRESENT_PARAMETERS params = {};
+-    presenter->GetPresentParameters(&params);
+-    HRESULT hr = presenter->GetUnityOutput().acquireSharedFrame(params.BackBufferWidth, params.BackBufferHeight,
+-      scene, gui, width, height);
+-    return hr == S_OK ? REMIXAPI_ERROR_CODE_SUCCESS : REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+-  }
+-
+-  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_ReleaseSharedD3D11Frame(void) {
+-    std::lock_guard lock(s_mutex);
+-    auto device = tryAsDxvk();
+-    if (!device || !device->GetExternalPresenter()) {
+-      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+-    }
+-    HRESULT hr = device->GetExternalPresenter()->GetUnityOutput().releaseSharedFrame();
+-    return SUCCEEDED(hr) ? REMIXAPI_ERROR_CODE_SUCCESS : REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+-  }
+-
+-  REMIXAPI uint64_t REMIXAPI_CALL remixapi_GetUnityOutputState(void) {
+-    std::lock_guard lock(s_mutex);
+-    auto device = tryAsDxvk();
+-    if (!device || !device->GetExternalPresenter()) {
+-      return 0;
+-    }
+-    auto& output = device->GetExternalPresenter()->GetUnityOutput();
+-    const uint64_t input = device->GetDXVKDevice()->getCommon()->getImgui().hostInputState();
+-    return (output.copiedFrames() << 8) | input | (output.failed() ? 4ull : 0ull);
+-  }
++  }
++
++  // Unity's render callback is native-only. It never enters Mono or IL2CPP.
++  void __stdcall unityRenderEvent(int) {
++    std::unique_lock lock(s_mutex, std::try_to_lock);
++    if (!lock) {
++      return;
++    }
++    if (auto device = tryAsDxvk()) {
++      if (auto presenter = device->GetExternalPresenter()) {
++        presenter->GetUnityOutput().copyToUnity();
++      }
++    }
++  }
++
++  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_EnableUnityOutput(void) {
++    std::lock_guard lock(s_mutex);
++    auto device = tryAsDxvk();
++    if (!device || !device->GetExternalPresenter()) {
++      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
++    }
++    device->GetExternalPresenter()->EnableUnityOutput();
++    device->GetDXVKDevice()->getCommon()->getImgui().enableHostInput();
++    return REMIXAPI_ERROR_CODE_SUCCESS;
++  }
++
++  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_SetUnityOutputTargets(void* scene, void* gui) {
++    std::lock_guard lock(s_mutex);
++    auto device = tryAsDxvk();
++    if (!device || !device->GetExternalPresenter()) {
++      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
++    }
++    HRESULT hr = device->GetExternalPresenter()->GetUnityOutput().setTargets(
++      static_cast<ID3D11Texture2D*>(scene), static_cast<ID3D11Texture2D*>(gui));
++    return SUCCEEDED(hr) ? REMIXAPI_ERROR_CODE_SUCCESS : REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
++  }
++
++  REMIXAPI void* REMIXAPI_CALL remixapi_GetUnityRenderEvent(void) {
++    return reinterpret_cast<void*>(&unityRenderEvent);
++  }
++
++  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_AcquireSharedD3D11Frame(
++      void** scene, void** gui, uint32_t* width, uint32_t* height) {
++    if (!scene || !gui || !width || !height) {
++      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
++    }
++    *scene = *gui = nullptr;
++    *width = *height = 0;
++    std::lock_guard lock(s_mutex);
++    auto device = tryAsDxvk();
++    if (!device || !device->GetExternalPresenter()) {
++      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
++    }
++    auto presenter = device->GetExternalPresenter();
++    presenter->EnableUnityOutput();
++    device->GetDXVKDevice()->getCommon()->getImgui().enableHostInput();
++    D3DPRESENT_PARAMETERS params = {};
++    presenter->GetPresentParameters(&params);
++    HRESULT hr = presenter->GetUnityOutput().acquireSharedFrame(params.BackBufferWidth, params.BackBufferHeight,
++      scene, gui, width, height);
++    return hr == S_OK ? REMIXAPI_ERROR_CODE_SUCCESS : REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
++  }
++
++  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_ReleaseSharedD3D11Frame(void) {
++    std::lock_guard lock(s_mutex);
++    auto device = tryAsDxvk();
++    if (!device || !device->GetExternalPresenter()) {
++      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
++    }
++    HRESULT hr = device->GetExternalPresenter()->GetUnityOutput().releaseSharedFrame();
++    return SUCCEEDED(hr) ? REMIXAPI_ERROR_CODE_SUCCESS : REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
++  }
++
++  REMIXAPI uint64_t REMIXAPI_CALL remixapi_GetUnityOutputState(void) {
++    std::lock_guard lock(s_mutex);
++    auto device = tryAsDxvk();
++    if (!device || !device->GetExternalPresenter()) {
++      return 0;
++    }
++    auto& output = device->GetExternalPresenter()->GetUnityOutput();
++    const uint64_t input = device->GetDXVKDevice()->getCommon()->getImgui().hostInputState();
++    return (output.copiedFrames() << 8) | input | (output.failed() ? 4ull : 0ull);
++  }
+ 
+   remixapi_ErrorCode REMIXAPI_CALL remixapi_SetUIState(remixapi_UIState state) {
+     return dxvk::fork_hooks::setUiState(tryAsDxvk(), state);

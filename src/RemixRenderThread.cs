@@ -1,14 +1,14 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
-using System.Threading;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 
 namespace UnityRemix
 {
     /// <summary>
-    /// Manages the background render thread for Remix
+    /// Submits one Remix frame before Unity draws the corresponding camera/UI.
+    /// Managed submissions stay on Unity's main thread on both Mono and IL2CPP.
     /// </summary>
     public class RemixRenderThread
     {
@@ -26,17 +26,26 @@ namespace UnityRemix
         
         // Cached delegates
         private RemixAPI.PFN_remixapi_Present presentFunc;
+        private RemixAPI.PFN_remixapi_GetVramStats getVramStats;
+        private RemixAPI.PFN_remixapi_RequestVramCompaction requestVramCompaction;
+        private RemixAPI.PFN_remixapi_ResetScene resetNativeScene;
+        private DateTime nextMemoryLog = DateTime.MinValue;
         
         // Thread state
-        private Thread renderThread;
         private volatile bool renderThreadRunning = false;
         private volatile bool deviceReady = false;
         
         /// <summary>
-        /// True once the render thread has created the window and called Remix Startup successfully.
+        /// True once the render thread has initialized Remix's offscreen device.
         /// The main thread must not call any Remix API until this is true.
         /// </summary>
         public bool DeviceReady => deviceReady;
+        public bool HasStopped => started && !renderThreadRunning;
+        private bool started;
+        private int mainThreadFrame;
+        private long mainThreadPublishedFrame;
+        private bool frameRateOwned;
+        private int originalFrameRate, appliedFrameRate;
         
         // Test objects
         private IntPtr testMeshHandle = IntPtr.Zero;
@@ -45,6 +54,25 @@ namespace UnityRemix
         // Frame state
         private volatile RemixFrameCapture.FrameState currentFrameState = new RemixFrameCapture.FrameState();
         private readonly object captureLock = new object();
+        private readonly object renderLifecycleLock = new object();
+        private long publishedFrame;
+
+        // Scene resets discard every published handle before releasing native
+        // resources. Wait for the current Present to finish first.
+        public void ResetSceneResources(Action reset)
+        {
+            lock (renderLifecycleLock)
+            {
+                lock (captureLock) { currentFrameState = new RemixFrameCapture.FrameState(); publishedFrame++; }
+                if (resetNativeScene != null)
+                {
+                    var result = resetNativeScene();
+                    if (result != RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
+                        throw new InvalidOperationException($"Native scene reset failed: {result}");
+                }
+                reset();
+            }
+        }
         
         // Scene mesh scanner (optional)
         private SceneMeshScanner sceneMeshScanner;
@@ -74,6 +102,15 @@ namespace UnityRemix
             this.configUseGameGeometry = useGameGeometry;
             
             // Cache delegate
+            IntPtr resetSceneAddress = RemixAPI.GetRemixProcAddress("remixapi_ResetScene");
+            if (resetSceneAddress != IntPtr.Zero)
+                resetNativeScene = Marshal.GetDelegateForFunctionPointer<RemixAPI.PFN_remixapi_ResetScene>(resetSceneAddress);
+            else
+                logger.LogWarning("Native Remix runtime lacks the synchronized scene-reset extension; update the native Unity bridge for safe scene replacement.");
+            if (remixInterface.GetVramStats != IntPtr.Zero)
+                getVramStats = Marshal.GetDelegateForFunctionPointer<RemixAPI.PFN_remixapi_GetVramStats>(remixInterface.GetVramStats);
+            if (remixInterface.RequestVramCompaction != IntPtr.Zero)
+                requestVramCompaction = Marshal.GetDelegateForFunctionPointer<RemixAPI.PFN_remixapi_RequestVramCompaction>(remixInterface.RequestVramCompaction);
             if (remixInterface.Present != IntPtr.Zero)
             {
                 presentFunc = Marshal.GetDelegateForFunctionPointer<RemixAPI.PFN_remixapi_Present>(
@@ -97,6 +134,7 @@ namespace UnityRemix
             lock (captureLock)
             {
                 currentFrameState = newState;
+                publishedFrame++;
             }
         }
         
@@ -105,43 +143,77 @@ namespace UnityRemix
         /// </summary>
         public void Start()
         {
-            if (renderThread != null && renderThread.IsAlive)
+            if (renderThreadRunning)
             {
                 logger.LogInfo("Render thread already running");
                 return;
             }
             
             renderThreadRunning = true;
-            renderThread = new Thread(RenderThreadLoop);
-            renderThread.IsBackground = true;
-            renderThread.Start();
-            logger.LogInfo("Render thread started");
+            started = true;
+            try
+            {
+                InitializeRenderer();
+                logger.LogInfo("Remix submits on Unity's main thread and completes shared output before the matching camera/UI draw.");
+            }
+            catch
+            {
+                renderThreadRunning = false;
+                throw;
+            }
+        }
+
+        // Called before the selected Unity camera renders, after publishing its snapshot and targets.
+        public void SubmitMainThreadFrame()
+        {
+            if (!renderThreadRunning || !deviceReady || windowManager.CloseRequested) return;
+            // Cap the whole host frame; skipping just Remix would reintroduce
+            // different camera poses in the shared image and Unity UI.
+            int current = UnityEngine.Application.targetFrameRate;
+            if (frameRateOwned && current != appliedFrameRate) frameRateOwned = false;
+            if (configTargetFPS.Value > 0)
+            {
+                if (!frameRateOwned) originalFrameRate = current;
+                appliedFrameRate = originalFrameRate > 0 ? Math.Min(originalFrameRate, configTargetFPS.Value) : configTargetFPS.Value;
+                UnityEngine.Application.targetFrameRate = appliedFrameRate;
+                frameRateOwned = true;
+            }
+            else RestoreFrameRate();
+            lock (renderLifecycleLock)
+            {
+                lock (captureLock)
+                {
+                    if (mainThreadPublishedFrame == publishedFrame) return;
+                    mainThreadPublishedFrame = publishedFrame;
+                }
+                RenderFrame(mainThreadFrame++);
+            }
         }
         
         /// <summary>
         /// Stop the render thread
         /// </summary>
-        public void Stop()
+        public bool Stop()
         {
             renderThreadRunning = false;
-            if (renderThread != null && renderThread.IsAlive)
-            {
-                renderThread.Join(1000);
-            }
+            deviceReady = false;
+            RestoreFrameRate();
+            windowManager.DestroyRemixWindow();
+            return true;
         }
-        
-        /// <summary>
-        /// Main render loop
-        /// </summary>
-        private void RenderThreadLoop()
+        private void RestoreFrameRate()
         {
-            logger.LogInfo("Render thread loop starting...");
-            
-            // Create window on this thread
+            if (frameRateOwned && UnityEngine.Application.targetFrameRate == appliedFrameRate)
+                UnityEngine.Application.targetFrameRate = originalFrameRate;
+            frameRateOwned = false;
+        }
+
+        private void InitializeRenderer()
+        {
+            // Initialize the offscreen renderer against Unity's existing window.
             if (!windowManager.CreateRemixWindow())
             {
-                logger.LogError("Failed to create Remix window on render thread");
-                return;
+                throw new InvalidOperationException("Failed to initialize Remix shared output");
             }
             
             // Signal that the device is ready for API calls from other threads
@@ -152,47 +224,8 @@ namespace UnityRemix
             logger.LogInfo("Creating test triangle and light...");
             testMeshHandle = meshConverter.CreateTestTriangle();
             testLightHandle = lightConverter.CreateTestLight();
-            
-            int frameNum = 0;
-            
-            while (renderThreadRunning)
-            {
-                try
-                {
-                    // Process messages
-                    windowManager.PumpWindowsMessages();
-                    
-                    // Render frame
-                    RenderFrame(frameNum);
-                    frameNum++;
-                    
-                    // Frame rate limiting
-                    uint waitMs = 0;
-                    if (configTargetFPS.Value > 0)
-                    {
-                        waitMs = (uint)(1000 / configTargetFPS.Value);
-                    }
-                    else
-                    {
-                        waitMs = 1; // Uncapped but still responsive
-                    }
-                    
-                    // Wait for messages or timeout
-                    if (windowManager.WaitForMessages(waitMs))
-                    {
-                        windowManager.PumpWindowsMessages();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    logger.LogError($"Render thread error: {ex}");
-                    Thread.Sleep(1000);
-                }
-            }
-            
-            logger.LogInfo("Render thread loop ended");
         }
-        
+
         /// <summary>
         /// Render a single frame
         /// </summary>
@@ -202,7 +235,7 @@ namespace UnityRemix
             {
                 if (configUseGameGeometry.Value)
                 {
-                    // Process queued mesh creation on render thread (prevents main thread deadlocks)
+                    // Resolve queued mesh handles before submitting this snapshot.
                     frameCapture?.ProcessMeshCreationBatch();
                     
                     // Render game geometry
@@ -256,10 +289,38 @@ namespace UnityRemix
                         }
                     }
                 }
+                if (getVramStats != null && DateTime.UtcNow >= nextMemoryLog)
+                {
+                    nextMemoryLog = DateTime.UtcNow.AddSeconds(30);
+                    if (getVramStats(out var memory) == RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
+                    {
+                        logger.LogInfo($"[RemixMemory] MiB: used={memory.totalUsedBytes / 1048576} retained={memory.poolRetainedBytes / 1048576} " +
+                            $"textures={memory.usedMaterialTextureBytes / 1048576} geometry={memory.usedReplacementGeometryBytes / 1048576} " +
+                            $"buffers={memory.usedBufferBytes / 1048576} acceleration={memory.usedAccelerationStructureBytes / 1048576} " +
+                            $"targets={memory.usedRenderTargetBytes / 1048576} driver={memory.driverAllocatedBytes / 1048576} " +
+                            $"budget={memory.driverBudgetBytes / 1048576} textureEntries={memory.forkTextureCacheCount}");
+                        // Unity and Remix share the GPU. Vulkan's budget alone
+                        // does not reliably reflect pressure from Unity's other
+                        // graphics device. Periodically return completely empty
+                        // chunks once retained space exceeds 512 MiB. Live
+                        // suballocations and textures are never purged here.
+                        if (requestVramCompaction != null && memory.poolRetainedBytes > 512UL * 1048576)
+                        {
+                            var result = requestVramCompaction();
+                            if (result != RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
+                                logger.LogWarning($"Remix memory compaction request failed: {result}");
+                            else
+                                logger.LogInfo("[RemixMemory] Requested release of empty allocator blocks.");
+                        }
+                    }
+                }
             }
             catch (Exception ex)
             {
                 logger.LogError($"Error in RenderFrame: {ex}");
+                // A native exception can leave the device unusable. Exit cleanly
+                // instead of calling it again on every frame after the failure.
+                renderThreadRunning = false;
             }
         }
         
@@ -361,7 +422,10 @@ namespace UnityRemix
         private void RenderSkinnedMeshes(RemixFrameCapture.FrameState state, uint startObjectPickingValue)
         {
             if (state.skinned == null || state.skinned.Count == 0)
+            {
+                meshConverter.CleanupStaleSkinnedMeshes(new HashSet<ulong>());
                 return;
+            }
             
             HashSet<ulong> updatedMeshes = new HashSet<ulong>();
             uint objectPickingValue = startObjectPickingValue;
@@ -421,11 +485,14 @@ namespace UnityRemix
                         
                         meshConverter.UpdateSkinnedMeshHandle(skinned.remixMeshHash, meshHandle);
                         updatedMeshes.Add(skinned.remixMeshHash);
-                        meshConverter.DrawMeshInstance(meshHandle, skinned.localToWorld, objectPickingValue);
+                        meshConverter.DrawMeshInstance(meshHandle, skinned.localToWorld, objectPickingValue, skinned.particle);
                         objectPickingValue++;
                     }
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    throw new InvalidOperationException($"Unable to render skinned mesh 0x{skinned.remixMeshHash:X16}", ex);
+                }
             }
             
             // Cleanup stale meshes periodically

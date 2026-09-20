@@ -123,6 +123,7 @@ namespace UnityRemix
                 if (manifest != null)
                 {
                     // Load on a background thread — reading large files + creating meshes freezes the game
+                    // File parsing only: do not register CoreCLR-only workers with Boehm.
                     var thread = new Thread(() => LoadSceneFromManifest(info));
                     thread.IsBackground = true;
                     thread.Start();

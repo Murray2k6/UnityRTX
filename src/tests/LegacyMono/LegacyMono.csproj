@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../UnityMaterialSemantics.cs" Link="UnityMaterialSemantics.cs" />
+    <Compile Include="../../legacy/LegacyPlugin.cs" Link="LegacyPlugin.cs" />
+    <Compile Include="../../legacy/LegacyMaterialPolicy.cs" Link="LegacyMaterialPolicy.cs" />
+    <Compile Include="../../legacy/LegacyMaterialProperties.cs" Link="LegacyMaterialProperties.cs" />
+    <Compile Include="../../legacy/LegacyUiDiscovery.cs" Link="LegacyUiDiscovery.cs" />
+    <Compile Include="../../legacy/LegacyLighting.cs" Link="LegacyLighting.cs" />
+  </ItemGroup>
+</Project>

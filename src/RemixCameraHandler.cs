@@ -203,7 +203,7 @@ namespace UnityRemix
             }
             
             // Log camera change
-            if (selectedCamera != null && selectedCamera.name != lastCameraName)
+            if (selectedCamera != null && (selectedCamera != currentCamera || selectedCamera.name != lastCameraName))
             {
                 if (selectionReason.Contains("fallback"))
                 {
@@ -214,8 +214,10 @@ namespace UnityRemix
                     logger.LogInfo($"Using camera: '{selectedCamera.name}' ({selectionReason})");
                 }
                 lastCameraName = selectedCamera.name;
-                currentCamera = selectedCamera;
             }
+            // A new scene can replace a camera with another of the same name.
+            // The compositor must use the same object that was captured above.
+            currentCamera = selectedCamera;
             
             return selectedCamera;
         }

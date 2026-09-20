@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../RemixAPI.cs" Link="RemixAPI.cs" />
+    <Compile Include="../../RemixApiAdapter.cs" Link="RemixApiAdapter.cs" />
+    <Compile Include="../../RemixRuntimeProbe.cs" Link="RemixRuntimeProbe.cs" />
+    <Compile Include="../../RemixRuntimeSelection.cs" Link="RemixRuntimeSelection.cs" />
+    <Compile Include="../../RemixNativeBundle.cs" Link="RemixNativeBundle.cs" />
+    <Compile Include="../../PhasmophobiaLoaderReason.cs" Link="PhasmophobiaLoaderReason.cs" />
+    <None Include="native-layout.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

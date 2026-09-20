@@ -1,0 +1,15 @@
+diff --git a/src/dxvk/rtx_render/rtx_accel_manager.cpp b/src/dxvk/rtx_render/rtx_accel_manager.cpp
+--- a/src/dxvk/rtx_render/rtx_accel_manager.cpp
++++ b/src/dxvk/rtx_render/rtx_accel_manager.cpp
+@@ -457,4 +457,8 @@
+-        // Touch pooled (merged) BLAS
++        // Only the cached buckets participate in the reused TLAS. Touching the
++        // whole pool also refreshes retired BLASes, preventing their collection
++        // whenever unchanged frames alternate with geometry updates.
+-        for (auto& blas : m_blasPool) {
+-          blas->frameLastTouched = currentFrame;
++        for (auto& bucket : m_cachedBuckets) {
++          if (bucket.assignedBlas.ptr()) {
++            bucket.assignedBlas->frameLastTouched = currentFrame;
++          }
+         }

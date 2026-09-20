@@ -1,0 +1,1103 @@
+diff --git a/src/d3d9/d3d9_swapchain.h b/src/d3d9/d3d9_swapchain.h
+--- a/src/d3d9/d3d9_swapchain.h
++++ b/src/d3d9/d3d9_swapchain.h
+@@ -35,6 +35,9 @@
+ #include "../util/sync/sync_signal.h"
+ 
+ #include <vector>
++// NV-DXVK start: Unity shared output
++#include "../dxvk/rtx_render/rtx_unity_output.h"
++// NV-DXVK end
+ 
+ namespace dxvk {
+ 
+@@ -49,7 +52,8 @@
+     D3D9SwapChainEx(
+             D3D9DeviceEx*          pDevice,
+             D3DPRESENT_PARAMETERS* pPresentParams,
+-      const D3DDISPLAYMODEEX*      pFullscreenDisplayMode);
++      const D3DDISPLAYMODEEX*      pFullscreenDisplayMode,
++            bool                 externalOutput = false);
+ 
+     ~D3D9SwapChainEx();
+ 
+@@ -279,6 +283,10 @@
+   class D3D9SwapchainExternal final : public D3D9SwapChainEx {
+     Rc<RtxSemaphore> m_frameEndSemaphore;
+     Rc<RtxSemaphore> m_frameResumeSemaphore;
++    // NV-DXVK start: Unity shared output
++    std::atomic<bool> m_unityOutputEnabled = {false};
++    RtxUnityOutput m_unityOutput;
++    // NV-DXVK end
+ 
+   protected:
+     int NumFrontBuffers() override { return 0; };
+@@ -303,6 +311,8 @@
+             DWORD    dwFlags) override;
+ 
+ // NV-DXVK start: external API
++    void EnableUnityOutput() { m_unityOutputEnabled = true; }
++    RtxUnityOutput& GetUnityOutput() { return m_unityOutput; }
+     VkImage GetVkImage(uint32_t Index) const {
+       D3D9DeviceLock lock = m_parent->LockDevice();
+       if (Index < m_backBuffers.size()) {
+@@ -321,4 +331,4 @@
+ // NV-DXVK end
+   };
+ 
+-}
+\ No newline at end of file
++}
+diff --git a/src/d3d9/d3d9_swapchain.cpp b/src/d3d9/d3d9_swapchain.cpp
+--- a/src/d3d9/d3d9_swapchain.cpp
++++ b/src/d3d9/d3d9_swapchain.cpp
+@@ -288,6 +288,30 @@
+     // be invalidated
+     auto& gui = windowData.swapchain->getDxvkDevice()->getCommon()->getImgui();
+ 
++    // NV-DXVK start: Unity owns focus/raw input; queue Remix UI input safely
++    if (gui.hasHostInput()) {
++      gui.wndProcHandler(window, message, wParam, lParam);
++      const bool capture = (gui.hostInputState() & 2u) != 0;
++      const bool release = message == WM_KEYUP || message == WM_SYSKEYUP ||
++        message == WM_LBUTTONUP || message == WM_RBUTTONUP || message == WM_MBUTTONUP || message == WM_XBUTTONUP;
++      const bool systemShortcut = message == WM_SYSKEYDOWN && (wParam == VK_F4 || wParam == VK_RETURN);
++      if (capture && !release && !systemShortcut && ((message >= WM_KEYFIRST && message <= WM_KEYLAST) ||
++          (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) || message == WM_INPUT)) {
++        // WM_INPUT must reach DefWindowProc to release the raw-input buffer.
++        return CallCharsetFunction(DefWindowProcW, DefWindowProcA, unicode, window, message, wParam, lParam);
++      }
++      if (capture && message == WM_SETCURSOR && LOWORD(lParam) == HTCLIENT) {
++        SetCursor(LoadCursor(nullptr, IDC_ARROW));
++        return TRUE;
++      }
++      if (windowData.proc) {
++        return CallCharsetFunction(CallWindowProcW, CallWindowProcA, unicode,
++          windowData.proc, window, message, wParam, lParam);
++      }
++      return CallCharsetFunction(DefWindowProcW, DefWindowProcA, unicode, window, message, wParam, lParam);
++    }
++    // NV-DXVK end
++
+     if (message == WM_SETCURSOR) {
+       // If ImGui is initialized and wants to capture mouse
+       if (gui.isInit() && ImGui::GetIO().WantCaptureMouse) {
+@@ -353,7 +377,8 @@
+   D3D9SwapChainEx::D3D9SwapChainEx(
+           D3D9DeviceEx*          pDevice,
+           D3DPRESENT_PARAMETERS* pPresentParams,
+-    const D3DDISPLAYMODEEX*      pFullscreenDisplayMode)
++    const D3DDISPLAYMODEEX*      pFullscreenDisplayMode,
++          bool                 externalOutput)
+     : D3D9SwapChainExBase(pDevice)
+     , m_device           (pDevice->GetDXVKDevice())
+     , m_context          (m_device->createContext())
+@@ -377,12 +402,14 @@
+ 
+     UpdatePresentRegion(nullptr, nullptr);
+     
+-    if (m_window) {
++    // NV-DXVK start: The host already owns this window's presentation surface
++    if (m_window && !externalOutput) {
+       CreatePresenter();
+ 
+       if (!pDevice->GetOptions()->deferSurfaceCreation)
+         RecreateSwapChain(m_vsync);
+     }
++    // NV-DXVK end
+ 
+     CreateBackBuffers(m_presentParams.BackBufferCount);
+     CreateBlitter();
+@@ -1766,8 +1793,9 @@
+     m_displayRefreshRate = RefreshRate;
+ 
+     // NV-DXVK start: DLFG integration
+-    if (GetPresenter() != nullptr)
+-      GetPresenter()->setFrameRateLimiterRefreshRate(RefreshRate);
++    if (auto* pPresenter = GetActivePresenterOrNull()) {
++      pPresenter->setFrameRateLimiterRefreshRate(RefreshRate);
++    }
+   }
+ 
+ 
+diff --git a/src/d3d9/d3d9_swapchain_external.cpp b/src/d3d9/d3d9_swapchain_external.cpp
+--- a/src/d3d9/d3d9_swapchain_external.cpp
++++ b/src/d3d9/d3d9_swapchain_external.cpp
+@@ -36,7 +36,7 @@
+         D3D9DeviceEx* pDevice,
+         D3DPRESENT_PARAMETERS* pPresentParams,
+   const D3DDISPLAYMODEEX* pFullscreenDisplayMode)
+-    : D3D9SwapChainEx(pDevice, pPresentParams, pFullscreenDisplayMode) {
++    : D3D9SwapChainEx(pDevice, pPresentParams, pFullscreenDisplayMode, true) {
+     m_frameEndSemaphore = RtxSemaphore::createBinary(pDevice->GetDXVKDevice().ptr(), "ExternalPresenter::frameEnd");
+     m_frameResumeSemaphore = RtxSemaphore::createBinary(pDevice->GetDXVKDevice().ptr(), "ExternalPresenter::frameResume");
+   }
+@@ -50,18 +50,29 @@
+     // Update window handle with other systems
+     m_context->getCommonObjects()->setWindowHandle(m_window);
+ 
+-    auto srcImage = m_context->getCommonObjects()->getResources().getRaytracingOutput().m_finalOutput.resource(dxvk::Resources::AccessType::ReadWrite).image;
+-
+     auto targetImage = m_backBuffers[0]->GetCommonTexture()->GetImage();
+     auto swapImageView = m_backBuffers[0]->GetImageView(false);
+ 
+     auto& imageInfo = targetImage->info();
+ 
++    // NV-DXVK start: External output must replace the WSI frame-latency barrier
++    if (m_unityOutputEnabled) {
++      m_parent->Flush();
++      m_parent->SynchronizeCsThread();
++      m_device->waitForResource(targetImage, DxvkAccess::Read);
++    }
++    // NV-DXVK end
++
+     m_parent->m_rtx.EndFrame(targetImage);
+ 
+-    m_parent->EmitCs([this, cTargetImage = targetImage, cSrcImage = srcImage](DxvkContext* ctx) {
+-      dxvk::RtxContext::blitImageHelper(ctx, cSrcImage, cTargetImage, VkFilter::VK_FILTER_NEAREST);
++    // NV-DXVK start: Resolve the output after EndFrame creates it on the CS thread
++    m_parent->EmitCs([cTargetImage = targetImage](DxvkContext* ctx) {
++      auto srcImage = ctx->getCommonObjects()->getResources().getRaytracingOutput().m_finalOutput.resource(dxvk::Resources::AccessType::ReadWrite).image;
++      if (srcImage != nullptr) {
++        dxvk::RtxContext::blitImageHelper(ctx, srcImage, cTargetImage, VkFilter::VK_FILTER_NEAREST);
++      }
+     });
++    // NV-DXVK end
+ 
+     m_parent->Flush();
+     m_parent->SynchronizeCsThread();
+@@ -81,11 +92,14 @@
+       m_hud->render(m_context, fmt, { imageInfo.extent.width, imageInfo.extent.height });
+     }
+ 
+-    if (ImGUI::enableExternalPresenter() && g_combineGuiInFinalColor) {
++    // NV-DXVK start: Unity composites scene and Remix UI separately
++    if (!m_unityOutputEnabled && ImGUI::enableExternalPresenter() && g_combineGuiInFinalColor) {
+       m_device->getCommon()->getImgui().render(m_context, { imageInfo.extent.width, imageInfo.extent.height });
+     }
+-
+-    m_parent->m_rtx.OnPresent(targetImage);
++    if (m_unityOutputEnabled) {
++      m_unityOutput.render(m_context, targetImage);
++    }
++    // NV-DXVK end
+ 
+     m_context->changeImageLayout(targetImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+     m_context->emitMemoryBarrier(VK_DEPENDENCY_DEVICE_GROUP_BIT,
+@@ -95,16 +109,30 @@
+                                  VK_ACCESS_SHADER_READ_BIT);
+ 
+     // signal to external that rendering is done
+-    m_context->getCommandList()->addSignalSemaphore(m_frameEndSemaphore->handle(), 1);
++    // NV-DXVK start: D3D11 consumes a bounded shared image ring
++    if (!m_unityOutputEnabled) {
++      m_context->getCommandList()->addSignalSemaphore(m_frameEndSemaphore->handle(), 1);
++    }
++    // NV-DXVK end
++    // NV-DXVK start: Submit the swapchain's context before queuing the next frame
++    if (m_unityOutputEnabled) {
++      m_context->getCommandList()->trackResource<DxvkAccess::Read>(targetImage);
++    }
+     m_device->submitCommandList(m_context->endRecording(), VK_NULL_HANDLE, VK_NULL_HANDLE);
++    m_parent->m_rtx.OnPresent(targetImage);
++    // NV-DXVK end
+ 
+     m_parent->GetDXVKDevice()->incrementPresentCount();
+ 
+     // Wait on the next frame before resuming rendering
+-    m_parent->EmitCs([this](DxvkContext* ctx) {
+-      ctx->getCommandList()->addWaitSemaphore(m_frameResumeSemaphore->handle(), 1);
+-      ctx->flushCommandList();
+-    });
++    // NV-DXVK start: Unity uses completion queries instead of external Vulkan semaphores
++    if (!m_unityOutputEnabled) {
++      m_parent->EmitCs([this](DxvkContext* ctx) {
++        ctx->getCommandList()->addWaitSemaphore(m_frameResumeSemaphore->handle(), 1);
++        ctx->flushCommandList();
++      });
++    }
++    // NV-DXVK end
+ 
+     return S_OK;
+   }
+diff --git a/src/dxvk/meson.build b/src/dxvk/meson.build
+--- a/src/dxvk/meson.build
++++ b/src/dxvk/meson.build
+@@ -362,6 +362,8 @@
+   'rtx_render/rtx_texture.h',
+   'rtx_render/rtx_texture_manager.cpp',
+   'rtx_render/rtx_texture_manager.h',
++  'rtx_render/rtx_unity_output.cpp',
++  'rtx_render/rtx_unity_output.h',
+   'rtx_render/rtx_tone_mapping.cpp',
+   'rtx_render/rtx_tone_mapping.h',
+   'rtx_render/rtx_types.cpp',
+@@ -542,6 +544,7 @@
+ rtx_shaders = custom_target(
+   'rtx_shaders',
+   build_by_default: true,
++  depend_files: files('shaders/rtx/pass/imgui/unity_ui_alpha.comp.slang'),
+   output: ['_built_shaders.txt'],
+   command: [ python_interpreter ] + rtx_shaders_command_arguments
+ )
+diff --git a/src/dxvk/dxvk_image.cpp b/src/dxvk/dxvk_image.cpp
+--- a/src/dxvk/dxvk_image.cpp
++++ b/src/dxvk/dxvk_image.cpp
+@@ -50,6 +50,11 @@
+     info.initialLayout         = createInfo.initialLayout;
+ 
+     m_shared = canShareImage(info, createInfo.sharing);
++    // NV-DXVK start: Explicit shared-image requests must never silently become private images
++    if (createInfo.shared && createInfo.sharing.mode != DxvkSharedHandleMode::None && !m_shared) {
++      throw DxvkError("DxvkImage: Requested external-memory sharing is unsupported.");
++    }
++    // NV-DXVK end
+ 
+     VkExternalMemoryImageCreateInfo externalInfo;
+     if (m_shared) {
+diff --git a/src/dxvk/imgui/dxvk_imgui.h b/src/dxvk/imgui/dxvk_imgui.h
+--- a/src/dxvk/imgui/dxvk_imgui.h
++++ b/src/dxvk/imgui/dxvk_imgui.h
+@@ -84,6 +84,11 @@
+      * see: https://docs.microsoft.com/en-us/previous-versions/windows/desktop/legacy/ms633573(v=vs.85)
+      */
+     void wndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
++    // NV-DXVK start: Host input is consumed on the ImGui render thread
++    void enableHostInput() { m_hostInput = true; }
++    bool hasHostInput() const { return m_hostInput.load(); }
++    uint32_t hostInputState() const { return m_hostInputState.load(); }
++    // NV-DXVK end
+ 
+     /**
+      * \brief Render ImGUI
+@@ -125,6 +130,12 @@
+     }
+ 
+   private:
++    // NV-DXVK start: Host input queue
++    std::atomic<bool> m_hostInput = {false};
++    std::atomic<uint32_t> m_hostInputState = {0};
++    std::mutex m_hostInputMutex;
++    std::vector<MSG> m_hostMessages;
++    // NV-DXVK end
+     enum class ShaderMessageType {
+       None,
+       Ok,
+diff --git a/src/dxvk/imgui/dxvk_imgui.cpp b/src/dxvk/imgui/dxvk_imgui.cpp
+--- a/src/dxvk/imgui/dxvk_imgui.cpp
++++ b/src/dxvk/imgui/dxvk_imgui.cpp
+@@ -681,6 +681,26 @@
+   }
+ 
+   void ImGUI::wndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
++    // NV-DXVK start: No ImGui calls from Unity's message thread
++    if (m_hostInput) {
++      switch (msg) {
++      case WM_LBUTTONDBLCLK: case WM_RBUTTONDBLCLK: case WM_MBUTTONDBLCLK: case WM_XBUTTONDBLCLK:
++      case WM_MOUSEMOVE: case WM_LBUTTONDOWN: case WM_LBUTTONUP:
++      case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_MBUTTONDOWN: case WM_MBUTTONUP:
++      case WM_XBUTTONDOWN: case WM_XBUTTONUP: case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
++      case WM_KEYDOWN: case WM_KEYUP: case WM_SYSKEYDOWN: case WM_SYSKEYUP:
++      case WM_CHAR: case WM_SETFOCUS: case WM_KILLFOCUS: case WM_MOUSELEAVE: {
++        std::lock_guard lock(m_hostInputMutex);
++        if (m_hostMessages.size() < 4096) {
++          m_hostMessages.push_back(MSG{hWnd, msg, wParam, lParam});
++        }
++        break;
++      }
++      default: break;
++      }
++      return;
++    }
++    // NV-DXVK end
+     fork_hooks::imguiContextPin(m_context, m_plotContext);
+     if (m_overlayWin.ptr() != nullptr) {
+       m_overlayWin->gameWndProcHandler(hWnd, msg, wParam, lParam);
+@@ -941,7 +961,10 @@
+       showReflexLatencyStats();
+     }
+ 
+-    if (showUI == UIType::None) {
++    // NV-DXVK start: The Unity host controls cursor visibility on its main thread
++    if (m_hostInput) {
++      ImGui::GetIO().MouseDrawCursor = false;
++    } else if (showUI == UIType::None) {
+       ImGui::CloseCurrentPopup();
+       ImGui::GetIO().MouseDrawCursor = false;
+       // Restore OS cursor visibility (ShowCursor uses a reference counter)
+@@ -958,6 +981,7 @@
+     }
+ 
+     showHudMessages(ctx);
++    // NV-DXVK end
+ 
+ #ifdef REMIX_DEVELOPMENT
+     // Show visual indicator when crash hotkeys are armed (one option arms both CPU and GPU crash hotkeys)
+@@ -4702,14 +4726,39 @@
+     }
+ 
+     ImGui_ImplDxvk::NewFrame();
+-    ImGui_ImplWin32_NewFrame(); 
++    // NV-DXVK start: Drain host messages on the thread that owns ImGui
++    if (m_hostInput) {
++      std::vector<MSG> messages;
++      {
++        std::lock_guard lock(m_hostInputMutex);
++        messages.swap(m_hostMessages);
++      }
++      for (const auto& msg : messages) {
++        ImGui_ImplWin32_WndProcHandler(msg.hwnd, msg.message, msg.wParam, msg.lParam);
++      }
++    }
++    // NV-DXVK end
++    ImGui_ImplWin32_NewFrame();
+ 
+     ImGuiIO& io = ImGui::GetIO();
+     io.DisplaySize = ImVec2((float) surfaceSize.width, (float) surfaceSize.height);
++    // NV-DXVK start: Unity's main thread owns the OS cursor
++    if (m_hostInput) {
++      io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
++    }
++    // NV-DXVK end
+ 
+     ImGui::NewFrame();
+ 
+     update(ctx);
++
++    // NV-DXVK start: Main-thread cursor and input policy reads an atomic snapshot
++    if (m_hostInput) {
++      const bool menu = RtxOptions::showUI() != UIType::None;
++      m_hostInputState = (menu ? 1u : 0u) |
++        (menu && RtxOptions::blockInputToGameInUI() ? 2u : 0u);
++    }
++    // NV-DXVK end
+ 
+     ImGui_ImplDxvk::RenderDrawData(ImGui::GetDrawData(), ctx.ptr(), surfaceSize.width, surfaceSize.height);
+   }
+@@ -4876,6 +4925,11 @@
+     //  inflation.
+     freeUnusedMemory();
+ 
++    // NV-DXVK start: Unity restores its own cursor state
++    if (m_hostInput) {
++      return;
++    }
++    // NV-DXVK end
+     ::ShowCursor(m_prevCursorVisible);
+     if (RtxOptions::restoreCursorPosition()) {
+       ::SetPhysicalCursorPos(m_cachedGameCursorX, m_cachedGameCursorY);
+diff --git a/src/dxvk/imgui/imgui_impl_win32.cpp b/src/dxvk/imgui/imgui_impl_win32.cpp
+--- a/src/dxvk/imgui/imgui_impl_win32.cpp
++++ b/src/dxvk/imgui/imgui_impl_win32.cpp
+@@ -705,8 +705,10 @@
+         if (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONDBLCLK) { button = 1; }
+         if (msg == WM_MBUTTONDOWN || msg == WM_MBUTTONDBLCLK) { button = 2; }
+         if (msg == WM_XBUTTONDOWN || msg == WM_XBUTTONDBLCLK) { button = (GET_XBUTTON_WPARAM(wParam) == XBUTTON1) ? 3 : 4; }
+-        if (bd->MouseButtonsDown == 0 && ::GetCapture() == NULL)
++        // NV-DXVK start: Queued host input must not capture another thread's window
++        if (bd->MouseButtonsDown == 0 && ::GetCapture() == NULL && ::GetWindowThreadProcessId(hwnd, nullptr) == ::GetCurrentThreadId())
+             ::SetCapture(hwnd);
++        // NV-DXVK end
+         bd->MouseButtonsDown |= 1 << button;
+         io.AddMouseButtonEvent(button, true);
+         return 0;
+@@ -722,8 +724,10 @@
+         if (msg == WM_MBUTTONUP) { button = 2; }
+         if (msg == WM_XBUTTONUP) { button = (GET_XBUTTON_WPARAM(wParam) == XBUTTON1) ? 3 : 4; }
+         bd->MouseButtonsDown &= ~(1 << button);
+-        if (bd->MouseButtonsDown == 0 && ::GetCapture() == hwnd)
++        // NV-DXVK start: Preserve the host thread's mouse capture
++        if (bd->MouseButtonsDown == 0 && ::GetCapture() == hwnd && ::GetWindowThreadProcessId(hwnd, nullptr) == ::GetCurrentThreadId())
+             ::ReleaseCapture();
++        // NV-DXVK end
+         io.AddMouseButtonEvent(button, false);
+         return 0;
+     }
+diff --git a/src/dxvk/rtx_render/rtx_remix_api.cpp b/src/dxvk/rtx_render/rtx_remix_api.cpp
+--- a/src/dxvk/rtx_render/rtx_remix_api.cpp
++++ b/src/dxvk/rtx_render/rtx_remix_api.cpp
+@@ -2177,7 +2177,7 @@
+         D3DADAPTER_DEFAULT,
+         D3DDEVTYPE_HAL,
+         hwnd,
+-        D3DCREATE_HARDWARE_VERTEXPROCESSING,
++        D3DCREATE_HARDWARE_VERTEXPROCESSING | (info->forceNoVkSwapchain ? D3DCREATE_NOWINDOWCHANGES : 0),
+         &presInfo,
+         nullptr,
+         &d3d9Device);
+@@ -2204,20 +2204,22 @@
+   remixapi_ErrorCode REMIXAPI_CALL remixapi_Shutdown(void) {
+     // Clear fork-owned callback state (lives in rtx_fork_api_entry.cpp)
+     dxvk::fork_hooks::shutdownCallbacks();
++    IDirect3DDevice9Ex* retiringDevice = nullptr;
+     {
+       std::lock_guard lock { s_mutex };
++      retiringDevice = s_dxvkDevice;
++      s_dxvkDevice = nullptr;
+       s_persistentInstances.clear();
+       s_pendingPersistentInstanceUpserts.clear();
+       s_pendingPersistentInstanceDestroys.clear();
+     }
+-    if (s_dxvkDevice) {
++    if (retiringDevice) {
+       while (true) {
+-        ULONG left = s_dxvkDevice->Release();
++        ULONG left = retiringDevice->Release();
+         if (left == 0) {
+           break;
+         }
+       }
+-      s_dxvkDevice = nullptr;
+     }
+     if (s_dxvkD3D9) {
+       while (true) {
+@@ -2373,9 +2375,9 @@
+     }
+ 
+     if (windowWidth > 0 && windowHeight > 0) {
+-      IDirect3DSwapChain9* swapchain = nullptr;
++      dxvk::Com<IDirect3DSwapChain9> swapchain;
+       hr = remixDevice->GetSwapChain(0, &swapchain);
+-      if (FAILED(hr) || !swapchain) {
++      if (FAILED(hr) || swapchain == nullptr) {
+         return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+       }
+       D3DPRESENT_PARAMETERS presentParams{};
+@@ -2385,7 +2387,7 @@
+       }
+ 
+       // reset swapchain if window has changed
+-      if (presentParams.BackBufferWidth != windowWidth && //
++      if (presentParams.BackBufferWidth != windowWidth ||
+           presentParams.BackBufferHeight != windowHeight) {
+         presentParams.BackBufferWidth = windowWidth;
+         presentParams.BackBufferHeight = windowHeight;
+@@ -2730,6 +2732,88 @@
+ 
+   remixapi_UIState REMIXAPI_CALL remixapi_GetUIState(void) {
+     return dxvk::fork_hooks::getUiState(tryAsDxvk());
++  }
++
++  // Unity's render callback is native-only. It never enters Mono or IL2CPP.
++  void __stdcall unityRenderEvent(int) {
++    std::unique_lock lock(s_mutex, std::try_to_lock);
++    if (!lock) {
++      return;
++    }
++    if (auto device = tryAsDxvk()) {
++      if (auto presenter = device->GetExternalPresenter()) {
++        presenter->GetUnityOutput().copyToUnity();
++      }
++    }
++  }
++
++  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_EnableUnityOutput(void) {
++    std::lock_guard lock(s_mutex);
++    auto device = tryAsDxvk();
++    if (!device || !device->GetExternalPresenter()) {
++      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
++    }
++    device->GetExternalPresenter()->EnableUnityOutput();
++    device->GetDXVKDevice()->getCommon()->getImgui().enableHostInput();
++    return REMIXAPI_ERROR_CODE_SUCCESS;
++  }
++
++  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_SetUnityOutputTargets(void* scene, void* gui) {
++    std::lock_guard lock(s_mutex);
++    auto device = tryAsDxvk();
++    if (!device || !device->GetExternalPresenter()) {
++      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
++    }
++    HRESULT hr = device->GetExternalPresenter()->GetUnityOutput().setTargets(
++      static_cast<ID3D11Texture2D*>(scene), static_cast<ID3D11Texture2D*>(gui));
++    return SUCCEEDED(hr) ? REMIXAPI_ERROR_CODE_SUCCESS : REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
++  }
++
++  REMIXAPI void* REMIXAPI_CALL remixapi_GetUnityRenderEvent(void) {
++    return reinterpret_cast<void*>(&unityRenderEvent);
++  }
++
++  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_AcquireSharedD3D11Frame(
++      void** scene, void** gui, uint32_t* width, uint32_t* height) {
++    if (!scene || !gui || !width || !height) {
++      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
++    }
++    *scene = *gui = nullptr;
++    *width = *height = 0;
++    std::lock_guard lock(s_mutex);
++    auto device = tryAsDxvk();
++    if (!device || !device->GetExternalPresenter()) {
++      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
++    }
++    auto presenter = device->GetExternalPresenter();
++    presenter->EnableUnityOutput();
++    device->GetDXVKDevice()->getCommon()->getImgui().enableHostInput();
++    D3DPRESENT_PARAMETERS params = {};
++    presenter->GetPresentParameters(&params);
++    HRESULT hr = presenter->GetUnityOutput().acquireSharedFrame(params.BackBufferWidth, params.BackBufferHeight,
++      scene, gui, width, height);
++    return hr == S_OK ? REMIXAPI_ERROR_CODE_SUCCESS : REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
++  }
++
++  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_ReleaseSharedD3D11Frame(void) {
++    std::lock_guard lock(s_mutex);
++    auto device = tryAsDxvk();
++    if (!device || !device->GetExternalPresenter()) {
++      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
++    }
++    HRESULT hr = device->GetExternalPresenter()->GetUnityOutput().releaseSharedFrame();
++    return SUCCEEDED(hr) ? REMIXAPI_ERROR_CODE_SUCCESS : REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
++  }
++
++  REMIXAPI uint64_t REMIXAPI_CALL remixapi_GetUnityOutputState(void) {
++    std::lock_guard lock(s_mutex);
++    auto device = tryAsDxvk();
++    if (!device || !device->GetExternalPresenter()) {
++      return 0;
++    }
++    auto& output = device->GetExternalPresenter()->GetUnityOutput();
++    const uint64_t input = device->GetDXVKDevice()->getCommon()->getImgui().hostInputState();
++    return (output.copiedFrames() << 8) | input | (output.failed() ? 4ull : 0ull);
+   }
+ 
+   remixapi_ErrorCode REMIXAPI_CALL remixapi_SetUIState(remixapi_UIState state) {
+diff --git a/src/dxvk/rtx_render/rtx_fork_api_entry.cpp b/src/dxvk/rtx_render/rtx_fork_api_entry.cpp
+--- a/src/dxvk/rtx_render/rtx_fork_api_entry.cpp
++++ b/src/dxvk/rtx_render/rtx_fork_api_entry.cpp
+@@ -14,7 +14,7 @@
+ //           * drawScreenOverlay   — stages pixel data into s_pendingScreenOverlay
+ //           * presentScreenOverlayFlush — drains s_pendingScreenOverlay each frame
+ //           * getUiState / setUiState
+-//           * getSharedD3D11TextureHandle (stub)
++//           * getSharedD3D11TextureHandle (shared frame lease)
+ //           * dxvkGetTextureHash
+ //           * createTexture / destroyTexture
+ //   #7c  — interception + vtable init + frame-boundary callback infrastructure:
+@@ -54,6 +54,7 @@
+ 
+ #include "../../d3d9/d3d9_device.h"       // D3D9DeviceEx, LockDevice, EmitCs, GetDXVKDevice
+ #include "../../d3d9/d3d9_texture.h"      // D3D9CommonTexture, GetCommonTexture
++#include "../../d3d9/d3d9_swapchain.h"
+ 
+ #include "../../util/xxHash/xxhash.h"     // XXH64_hash_t
+ 
+@@ -375,12 +376,8 @@
+   // ---------------------------------------------------------------------------
+   // getSharedD3D11TextureHandle (migration #7b)
+   //
+-  // Stub. The DX11 shared-memory export backbuffer path (gmod commit 098a7471)
+-  // is not ported to this fork. This code path is only exercised when the host
+-  // app opts into external-swapchain mode via dxvk_CreateD3D9(forceNoVkSwapchain
+-  // == TRUE). Separate-window mode (used by Skyrim) never calls this. Returns
+-  // GENERAL_FAILURE so callers fall back; the vtable slot is populated so the
+-  // struct layout matches the header the plugin was built against.
++  // Acquires a completed frame. Release the lease through
++  // remixapi_ReleaseSharedD3D11Frame after the consumer's GPU use completes.
+   // ---------------------------------------------------------------------------
+   remixapi_ErrorCode getSharedD3D11TextureHandle(
+       D3D9DeviceEx* remixDevice,
+@@ -393,7 +390,19 @@
+     if (!out_sharedHandle || !out_width || !out_height) {
+       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+     }
+-    return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
++    *out_sharedHandle = nullptr;
++    *out_width = *out_height = 0;
++    auto presenter = remixDevice->GetExternalPresenter();
++    if (!presenter) {
++      return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
++    }
++    presenter->EnableUnityOutput();
++    remixDevice->GetDXVKDevice()->getCommon()->getImgui().enableHostInput();
++    D3DPRESENT_PARAMETERS params = {};
++    presenter->GetPresentParameters(&params);
++    HRESULT hr = presenter->GetUnityOutput().acquireSharedFrame(params.BackBufferWidth, params.BackBufferHeight,
++      out_sharedHandle, nullptr, out_width, out_height);
++    return hr == S_OK ? REMIXAPI_ERROR_CODE_SUCCESS : REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+   }
+ 
+   // ---------------------------------------------------------------------------
+diff --git a/src/dxvk/rtx_render/rtx_fork_hooks.h b/src/dxvk/rtx_render/rtx_fork_hooks.h
+--- a/src/dxvk/rtx_render/rtx_fork_hooks.h
++++ b/src/dxvk/rtx_render/rtx_fork_hooks.h
+@@ -296,9 +296,7 @@
+     // Implementation in rtx_fork_api_entry.cpp.
+     remixapi_ErrorCode setUiState(D3D9DeviceEx* remixDevice, remixapi_UIState state);
+ 
+-    // Stub: the DX11 shared-memory export backbuffer path is not ported to this
+-    // fork. Validates arguments then returns GENERAL_FAILURE so callers fall back;
+-    // the vtable slot is populated so the struct layout matches the plugin ABI.
++    // Acquires a completed shared frame. Release after the consumer's GPU work completes.
+     // No private-member access; no friend declaration needed.
+     // Implementation in rtx_fork_api_entry.cpp.
+     remixapi_ErrorCode getSharedD3D11TextureHandle(
+diff --git a/src/dxvk/rtx_render/rtx_unity_output.h b/src/dxvk/rtx_render/rtx_unity_output.h
+new file mode 100644
+--- /dev/null
++++ b/src/dxvk/rtx_render/rtx_unity_output.h
+@@ -0,0 +1,63 @@
++#pragma once
++
++#include "../dxvk_image.h"
++#include "../../util/com/com_pointer.h"
++#define D3D11_NO_HELPERS
++#include <d3d11.h>
++#include <array>
++#include <mutex>
++
++namespace dxvk {
++  class DxvkContext;
++
++  // Swapchain-owned exchange. Unity reads on its render thread; Remix writes on
++  // its presentation thread. A slot is reusable only after both GPUs finish.
++  class RtxUnityOutput {
++  public:
++    HRESULT setTargets(ID3D11Texture2D* pScene, ID3D11Texture2D* pGui);
++    void copyToUnity();
++    void render(const Rc<DxvkContext>& ctx, const Rc<DxvkImage>& scene);
++    uint64_t copiedFrames() const { return m_copiedFrames.load(); }
++    bool failed() const { return m_failed.load(); }
++    HRESULT acquireSharedFrame(uint32_t width, uint32_t height, HANDLE* pScene, HANDLE* pGui,
++      uint32_t* pWidth, uint32_t* pHeight);
++    HRESULT releaseSharedFrame();
++
++  private:
++    struct SystemModules {
++      HMODULE d3d11 = nullptr, dxgi = nullptr;
++      ~SystemModules() {
++        if (d3d11) { FreeLibrary(d3d11); }
++        if (dxgi) { FreeLibrary(dxgi); }
++      }
++    } m_modules;
++    void ensureSharedDevice(const DxvkDevice* pDevice);
++    struct Slot {
++      // KMT imports do not own the D3D11 allocation. Destroy these owners last.
++      std::array<Com<ID3D11Texture2D>, 2> storage;
++      std::array<Rc<DxvkImage>, 2> images;
++      std::array<Rc<DxvkImageView>, 2> views;
++      std::array<HANDLE, 2> handles = {};
++      std::array<Com<ID3D11Texture2D>, 2> opened;
++      Com<ID3D11Query> complete;
++      uint64_t sequence = 0;
++      bool reading = false;
++      bool rendering = false;
++      bool leased = false;
++    };
++    std::mutex m_mutex;
++    std::array<Slot, 3> m_slots;
++    Rc<DxvkImage> m_guiImage;
++    Rc<DxvkImageView> m_guiView;
++    std::array<Com<ID3D11Texture2D>, 2> m_targets;
++    Com<ID3D11Device> m_unityDevice;
++    Com<ID3D11Device> m_sharedDevice;
++    D3D11_TEXTURE2D_DESC m_requested = {};
++    D3D11_TEXTURE2D_DESC m_allocated = {};
++    uint64_t m_sequence = 0;
++    uint64_t m_lastCopied = 0;
++    int m_lease = -1;
++    std::atomic<uint64_t> m_copiedFrames = {0};
++    std::atomic<bool> m_failed = {false};
++  };
++}
+diff --git a/src/dxvk/rtx_render/rtx_unity_output.cpp b/src/dxvk/rtx_render/rtx_unity_output.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/dxvk/rtx_render/rtx_unity_output.cpp
+@@ -0,0 +1,376 @@
++#include "rtx_unity_output.h"
++#include "rtx_context.h"
++#include "../dxvk_device.h"
++#include "../dxvk_objects.h"
++#include "../imgui/dxvk_imgui.h"
++#include "rtx_shader_manager.h"
++#include <rtx_shaders/unity_ui_alpha.h>
++
++namespace dxvk {
++  namespace {
++    class UnityUiAlphaShader : public ManagedShader {
++      SHADER_SOURCE(UnityUiAlphaShader, VK_SHADER_STAGE_COMPUTE_BIT, unity_ui_alpha)
++      BEGIN_PARAMETER()
++        RW_TEXTURE2D(0)
++      END_PARAMETER()
++    };
++  }
++
++  void RtxUnityOutput::ensureSharedDevice(const DxvkDevice* pDevice) {
++    const auto& id = pDevice->adapter()->devicePropertiesExt().coreDeviceId;
++    if (!id.deviceLUIDValid) {
++      throw DxvkError("Unity output: Vulkan adapter has no Windows LUID.");
++    }
++    if (m_sharedDevice == nullptr && m_unityDevice != nullptr) {
++      m_sharedDevice = m_unityDevice;
++    }
++    if (m_sharedDevice == nullptr) {
++      m_modules.dxgi = LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
++      m_modules.d3d11 = LoadLibraryExW(L"d3d11.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
++      using CreateFactory = HRESULT (WINAPI*)(REFIID, void**);
++      auto createFactory = reinterpret_cast<CreateFactory>(GetProcAddress(m_modules.dxgi, "CreateDXGIFactory1"));
++      auto createDevice = reinterpret_cast<PFN_D3D11_CREATE_DEVICE>(GetProcAddress(m_modules.d3d11, "D3D11CreateDevice"));
++      if (!createFactory || !createDevice) {
++        throw DxvkError("Unity output: system D3D11 runtime is unavailable.");
++      }
++      Com<IDXGIFactory1> factory;
++      if (FAILED(createFactory(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) {
++        throw DxvkError("Unity output: could not enumerate D3D11 adapters.");
++      }
++      for (UINT i = 0; ; i++) {
++        Com<IDXGIAdapter1> adapter;
++        HRESULT result = factory->EnumAdapters1(i, &adapter);
++        if (result == DXGI_ERROR_NOT_FOUND) { break; }
++        if (FAILED(result)) { throw DxvkError("Unity output: D3D11 adapter enumeration failed."); }
++        DXGI_ADAPTER_DESC1 desc = {};
++        adapter->GetDesc1(&desc);
++        if (memcmp(&desc.AdapterLuid, id.deviceLUID, sizeof(LUID)) == 0) {
++          if (FAILED(createDevice(adapter.ptr(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0,
++              D3D11_SDK_VERSION, &m_sharedDevice, nullptr, nullptr))) {
++            throw DxvkError("Unity output: D3D11 device creation failed.");
++          }
++          break;
++        }
++      }
++    }
++    if (m_sharedDevice == nullptr) { throw DxvkError("Unity output: no matching D3D11 adapter."); }
++    Com<IDXGIDevice> dxgiDevice;
++    Com<IDXGIAdapter> adapter;
++    DXGI_ADAPTER_DESC desc = {};
++    if (FAILED(m_sharedDevice->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDevice))) ||
++        FAILED(dxgiDevice->GetAdapter(&adapter)) || FAILED(adapter->GetDesc(&desc)) ||
++        memcmp(&desc.AdapterLuid, id.deviceLUID, sizeof(LUID)) != 0) {
++      throw DxvkError("Unity output: Unity and Remix must use the same GPU.");
++    }
++  }
++
++  HRESULT RtxUnityOutput::acquireSharedFrame(uint32_t width, uint32_t height, HANDLE* pScene, HANDLE* pGui,
++      uint32_t* pWidth, uint32_t* pHeight) {
++    std::lock_guard lock(m_mutex);
++    *pScene = nullptr;
++    if (pGui) { *pGui = nullptr; }
++    *pWidth = *pHeight = 0;
++    if (m_failed) { return E_FAIL; }
++    if (m_targets[0] == nullptr) {
++      m_requested.Width = width;
++      m_requested.Height = height;
++      m_requested.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    }
++    if (m_lease < 0) {
++      for (int i = 0; i < int(m_slots.size()); i++) {
++        const auto& slot = m_slots[i];
++        if (slot.sequence && !slot.reading && !slot.rendering && slot.images[0] != nullptr &&
++            !slot.images[0]->isInUse(DxvkAccess::Read) && !slot.images[1]->isInUse(DxvkAccess::Read) &&
++            (m_lease < 0 || slot.sequence > m_slots[m_lease].sequence)) {
++          m_lease = i;
++        }
++      }
++    }
++    if (m_lease < 0) { return E_PENDING; }
++    auto& slot = m_slots[m_lease];
++    slot.leased = true;
++    *pScene = slot.handles[0];
++    if (pGui) { *pGui = slot.handles[1]; }
++    *pWidth = m_allocated.Width;
++    *pHeight = m_allocated.Height;
++    return S_OK;
++  }
++
++  HRESULT RtxUnityOutput::releaseSharedFrame() {
++    std::lock_guard lock(m_mutex);
++    if (m_lease < 0) { return E_INVALIDARG; }
++    m_slots[m_lease].leased = false;
++    m_lease = -1;
++    return S_OK;
++  }
++
++  HRESULT RtxUnityOutput::setTargets(ID3D11Texture2D* pScene, ID3D11Texture2D* pGui) {
++    std::lock_guard lock(m_mutex);
++    if (!pScene && !pGui) {
++      m_targets = {};
++      return S_OK;
++    }
++    if (!pScene || !pGui) {
++      return E_INVALIDARG;
++    }
++    D3D11_TEXTURE2D_DESC scene = {}, gui = {};
++    pScene->GetDesc(&scene);
++    pGui->GetDesc(&gui);
++    // Unity uses typeless allocations even for linear RGBA8 render textures.
++    const auto typedFormat = [](DXGI_FORMAT format) {
++      if (format == DXGI_FORMAT_R8G8B8A8_TYPELESS) { return DXGI_FORMAT_R8G8B8A8_UNORM; }
++      if (format == DXGI_FORMAT_B8G8R8A8_TYPELESS) { return DXGI_FORMAT_B8G8R8A8_UNORM; }
++      return format;
++    };
++    scene.Format = typedFormat(scene.Format);
++    gui.Format = typedFormat(gui.Format);
++    if (scene.Width == 0 || scene.Height == 0 || scene.Width != gui.Width || scene.Height != gui.Height || scene.Format != gui.Format ||
++        scene.MipLevels != 1 || gui.MipLevels != 1 || scene.ArraySize != 1 || gui.ArraySize != 1 ||
++        scene.SampleDesc.Count != 1 || gui.SampleDesc.Count != 1 ||
++        (scene.Format != DXGI_FORMAT_R8G8B8A8_UNORM && scene.Format != DXGI_FORMAT_B8G8R8A8_UNORM)) {
++      Logger::err(str::format("Unity output: unsupported target pair. Scene ", scene.Width, "x", scene.Height,
++        " format=", uint32_t(scene.Format), " mips=", scene.MipLevels, " array=", scene.ArraySize,
++        " samples=", scene.SampleDesc.Count, "; UI ", gui.Width, "x", gui.Height,
++        " format=", uint32_t(gui.Format), " mips=", gui.MipLevels, " array=", gui.ArraySize,
++        " samples=", gui.SampleDesc.Count));
++      return E_INVALIDARG;
++    }
++    Com<ID3D11Device> device;
++    pScene->GetDevice(&device);
++    Com<ID3D11Device> guiDevice;
++    pGui->GetDevice(&guiDevice);
++    if (guiDevice.ptr() != device.ptr()) {
++      return E_INVALIDARG;
++    }
++    if (m_unityDevice != nullptr && m_unityDevice.ptr() != device.ptr()) {
++      return E_INVALIDARG;
++    }
++    m_unityDevice = device;
++    m_targets[0] = pScene;
++    m_targets[1] = pGui;
++    m_requested = scene;
++    return S_OK;
++  }
++
++  void RtxUnityOutput::copyToUnity() {
++    std::unique_lock lock(m_mutex, std::try_to_lock);
++    if (!lock || m_unityDevice == nullptr || m_failed) {
++      return;
++    }
++    Com<ID3D11DeviceContext> context;
++    m_unityDevice->GetImmediateContext(&context);
++    for (auto& slot : m_slots) {
++      if (slot.reading) {
++        HRESULT status = context->GetData(slot.complete.ptr(), nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
++        if (status == S_OK) {
++          slot.reading = false;
++        } else if (FAILED(status)) {
++          Logger::err("Unity output: D3D11 completion query failed; keeping in-flight shared frames alive.");
++          m_failed = true;
++          return;
++        }
++      }
++    }
++    if (m_targets[0] == nullptr || m_allocated.Width != m_requested.Width ||
++        m_allocated.Height != m_requested.Height || m_allocated.Format != m_requested.Format) {
++      return;
++    }
++    Slot* pLatest = nullptr;
++    for (auto& slot : m_slots) {
++      if (slot.sequence > m_lastCopied && !slot.reading && !slot.rendering && slot.images[0] != nullptr &&
++          !slot.images[0]->isInUse(DxvkAccess::Read) && !slot.images[1]->isInUse(DxvkAccess::Read) &&
++          (!pLatest || slot.sequence > pLatest->sequence)) {
++        pLatest = &slot;
++      }
++    }
++    if (!pLatest) {
++      return;
++    }
++    for (size_t i = 0; i < 2; i++) {
++      if (pLatest->opened[i] == nullptr && FAILED(m_unityDevice->OpenSharedResource(
++          pLatest->handles[i], __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&pLatest->opened[i])))) {
++        Logger::err("Unity output: D3D11 could not open the shared output image.");
++        m_failed = true;
++        return;
++      }
++    }
++    if (pLatest->complete == nullptr) {
++      D3D11_QUERY_DESC desc = {D3D11_QUERY_EVENT, 0};
++      if (FAILED(m_unityDevice->CreateQuery(&desc, &pLatest->complete))) {
++        m_failed = true;
++        return;
++      }
++    }
++    for (size_t i = 0; i < 2; i++) {
++      context->CopySubresourceRegion(m_targets[i].ptr(), 0, 0, 0, 0, pLatest->opened[i].ptr(), 0, nullptr);
++    }
++    context->End(pLatest->complete.ptr());
++    context->Flush();
++    pLatest->reading = true;
++    m_lastCopied = pLatest->sequence;
++    ++m_copiedFrames;
++  }
++
++  void RtxUnityOutput::render(const Rc<DxvkContext>& ctx, const Rc<DxvkImage>& scene) {
++    std::unique_lock lock(m_mutex, std::try_to_lock);
++    if (!lock || m_requested.Width == 0 || m_requested.Height == 0 || m_failed) {
++      return;
++    }
++    Slot* pAvailable = nullptr;
++    try {
++      if (m_allocated.Width != m_requested.Width || m_allocated.Height != m_requested.Height ||
++          m_allocated.Format != m_requested.Format) {
++        for (const auto& slot : m_slots) {
++          if (slot.reading || slot.rendering || slot.leased || (slot.images[0] != nullptr &&
++              (slot.images[0]->isInUse(DxvkAccess::Read) || slot.images[1]->isInUse(DxvkAccess::Read)))) {
++            return;
++          }
++        }
++        for (auto& slot : m_slots) {
++          slot.complete = nullptr;
++          slot.opened = {};
++          slot.views = {};
++          slot.images = {};
++          slot.storage = {};
++          slot.handles = {};
++          slot.sequence = 0;
++        }
++        auto device = ctx->getDevice();
++        ensureSharedDevice(device.ptr());
++        DxvkImageCreateInfo info = {};
++        info.type = VK_IMAGE_TYPE_2D;
++        info.format = m_requested.Format == DXGI_FORMAT_R8G8B8A8_UNORM ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B8G8R8A8_UNORM;
++        info.extent = {m_requested.Width, m_requested.Height, 1};
++        info.numLayers = 1;
++        info.mipLevels = 1;
++        info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
++        info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
++        info.stages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++        info.access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++        info.tiling = VK_IMAGE_TILING_OPTIMAL;
++        info.layout = VK_IMAGE_LAYOUT_GENERAL;
++        info.shared = VK_TRUE;
++        info.sharing.mode = DxvkSharedHandleMode::Import;
++        info.sharing.type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
++        for (auto& slot : m_slots) {
++          for (size_t i = 0; i < 2; i++) {
++            D3D11_TEXTURE2D_DESC shared = {};
++            shared.Width = m_requested.Width;
++            shared.Height = m_requested.Height;
++            shared.MipLevels = shared.ArraySize = 1;
++            shared.Format = m_requested.Format;
++            shared.SampleDesc.Count = 1;
++            shared.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
++            shared.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
++            if (FAILED(m_sharedDevice->CreateTexture2D(&shared, nullptr, &slot.storage[i]))) {
++              throw DxvkError("Unity output: shared D3D11 texture allocation failed.");
++            }
++            Com<IDXGIResource> resource;
++            if (FAILED(slot.storage[i]->QueryInterface(__uuidof(IDXGIResource), reinterpret_cast<void**>(&resource))) ||
++                FAILED(resource->GetSharedHandle(&slot.handles[i]))) {
++              throw DxvkError("Unity output: D3D11 shared handle creation failed.");
++            }
++            info.sharing.handle = slot.handles[i];
++            slot.images[i] = device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++              DxvkMemoryStats::RTXRenderTarget, "Unity shared output");
++            DxvkImageViewCreateInfo view = {};
++            view.type = VK_IMAGE_VIEW_TYPE_2D;
++            view.format = info.format;
++            view.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++            view.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
++            view.numLevels = 1;
++            view.numLayers = 1;
++            slot.views[i] = device->createImageView(slot.images[i], view);
++          }
++        }
++        info.format = VK_FORMAT_R8G8B8A8_UNORM;
++        info.shared = VK_FALSE;
++        info.sharing = {};
++        info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
++        m_guiImage = device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++          DxvkMemoryStats::RTXRenderTarget, "Unity UI compositing");
++        DxvkImageViewCreateInfo guiView = {};
++        guiView.format = info.format;
++        guiView.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
++        guiView.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
++        guiView.numLevels = guiView.numLayers = 1;
++        m_guiView = device->createImageView(m_guiImage, guiView);
++        m_allocated = m_requested;
++        Logger::info(str::format("Unity output: shared scene/UI ring allocated at ", info.extent.width, "x", info.extent.height));
++      }
++      for (auto& slot : m_slots) {
++        if (!slot.reading && !slot.rendering && !slot.leased && !slot.images[0]->isInUse(DxvkAccess::Read) && !slot.images[1]->isInUse(DxvkAccess::Read) &&
++            (!pAvailable || slot.sequence < pAvailable->sequence)) {
++          pAvailable = &slot;
++        }
++      }
++      if (!pAvailable) {
++        return;
++      }
++      pAvailable->rendering = true;
++      // ImGui callbacks may call the public API. Never hold the exchange mutex
++      // across those callbacks while another API call waits for this mutex.
++      lock.unlock();
++      // Submission boundaries drain DXVK's deferred layout transitions before
++      // transferring ownership between the Vulkan and D3D11 queues.
++      ctx->flushCommandList();
++      std::array<VkImageMemoryBarrier, 2> barriers = {};
++      for (size_t i = 0; i < 2; i++) {
++        auto& barrier = barriers[i];
++        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++        barrier.oldLayout = pAvailable->sequence ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
++        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
++        barrier.dstQueueFamilyIndex = ctx->getDevice()->queues().graphics.queueFamily;
++        barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++        barrier.image = pAvailable->images[i]->handle();
++        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++      }
++      ctx->getCommandList()->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer,
++        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers.data());
++      RtxContext::blitImageHelper(ctx.ptr(), scene, pAvailable->images[0], VK_FILTER_LINEAR);
++      ctx->clearColorImage(m_guiImage, VkClearColorValue{}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
++      DxvkRenderTargets targets;
++      targets.color[0].view = m_guiView;
++      targets.color[0].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      ctx->bindRenderTargets(targets);
++      ctx->getCommonObjects()->getImgui().render(ctx, {m_allocated.Width, m_allocated.Height});
++      // Unity's default UI material expects straight alpha, while rendering ImGui
++      // into a transparent target produces premultiplied color.
++      ctx->bindRenderTargets(DxvkRenderTargets{});
++      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, UnityUiAlphaShader::getShader());
++      ctx->bindResourceView(0, m_guiView, nullptr);
++      ctx->dispatch((m_allocated.Width + 7) / 8, (m_allocated.Height + 7) / 8, 1);
++      RtxContext::blitImageHelper(ctx.ptr(), m_guiImage, pAvailable->images[1], VK_FILTER_NEAREST);
++      for (auto& image : pAvailable->images) {
++        ctx->changeImageLayout(image, VK_IMAGE_LAYOUT_GENERAL);
++      }
++      ctx->flushCommandList();
++      for (auto& barrier : barriers) {
++        barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
++        barrier.srcQueueFamilyIndex = ctx->getDevice()->queues().graphics.queueFamily;
++        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
++        barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++        barrier.dstAccessMask = 0;
++      }
++      ctx->getCommandList()->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer,
++        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers.data());
++      for (auto& image : pAvailable->images) {
++        ctx->getCommandList()->trackResource<DxvkAccess::Write>(image);
++      }
++      lock.lock();
++      pAvailable->sequence = ++m_sequence;
++      pAvailable->rendering = false;
++    } catch (const DxvkError& e) {
++      if (!lock.owns_lock()) { lock.lock(); }
++      if (pAvailable) { pAvailable->rendering = false; }
++      Logger::err(str::format("Unity output disabled: ", e.message()));
++      m_failed = true;
++    } catch (const std::exception& e) {
++      if (!lock.owns_lock()) { lock.lock(); }
++      if (pAvailable) { pAvailable->rendering = false; }
++      Logger::err(str::format("Unity output disabled: ", e.what()));
++      m_failed = true;
++    }
++  }
++}
+diff --git a/src/dxvk/shaders/rtx/pass/imgui/unity_ui_alpha.comp.slang b/src/dxvk/shaders/rtx/pass/imgui/unity_ui_alpha.comp.slang
+new file mode 100644
+--- /dev/null
++++ b/src/dxvk/shaders/rtx/pass/imgui/unity_ui_alpha.comp.slang
+@@ -0,0 +1,16 @@
++// Convert the composited overlay to straight alpha for Unity UI/Default.
++[[vk::binding(0, 0)]]
++RWTexture2D<float4> overlay;
++
++[shader("compute")]
++[numthreads(8, 8, 1)]
++void main(uint3 pixel : SV_DispatchThreadID) {
++  uint width, height;
++  overlay.GetDimensions(width, height);
++  if (pixel.x >= width || pixel.y >= height) {
++    return;
++  }
++  float4 color = overlay[pixel.xy];
++  color.rgb = color.a > 0.0f ? saturate(color.rgb / color.a) : float3(0.0f);
++  overlay[pixel.xy] = color;
++}

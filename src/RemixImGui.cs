@@ -359,7 +359,7 @@ namespace UnityRemix
             _plotPlotLine = Resolve<D_PlotPlotLine>("remixapi_imgui_PlotPlotLine");
             _plotPlotBars = Resolve<D_PlotPlotBars>("remixapi_imgui_PlotPlotBars");
 
-            // DrawList (non-critical — graceful fallback if old d3d9.dll)
+            // Optional DrawList exports are not present in every supported native branch.
             _drawListAddLine = Resolve<D_DrawList_AddLine>("remixapi_imgui_DrawList_AddLine");
             _drawListAddRect = Resolve<D_DrawList_AddRect>("remixapi_imgui_DrawList_AddRect");
             _drawListAddRectFilled = Resolve<D_DrawList_AddRectFilled>("remixapi_imgui_DrawList_AddRectFilled");
@@ -371,7 +371,7 @@ namespace UnityRemix
             if (HasDrawListSupport)
                 log.LogInfo("[RemixImGui] DrawList exports resolved — 3D debug overlay available");
             else
-                log.LogWarning("[RemixImGui] DrawList exports NOT found — 3D debug boxes disabled (old d3d9.dll?)");
+                log.LogWarning("[RemixImGui] Optional DrawList exports are unavailable in this runtime; 3D debug boxes are disabled.");
             return true;
         }
 
@@ -382,8 +382,8 @@ namespace UnityRemix
         public static void RegisterDrawCallback(DrawCallback callback)
         {
             if (!_initialized || _registerDrawCallback == null) return;
-            _registeredCallback = callback;
-            IntPtr fnPtr = Marshal.GetFunctionPointerForDelegate(callback);
+            _registeredCallback = AttachCallback(callback);
+            IntPtr fnPtr = Marshal.GetFunctionPointerForDelegate(_registeredCallback);
             _registerDrawCallback(fnPtr, IntPtr.Zero);
         }
 
@@ -401,8 +401,8 @@ namespace UnityRemix
         public static bool RegisterOverlayCallback(DrawCallback callback)
         {
             if (!_initialized || _registerOverlayCallback == null) return false;
-            _registeredOverlayCallback = callback;
-            IntPtr fnPtr = Marshal.GetFunctionPointerForDelegate(callback);
+            _registeredOverlayCallback = AttachCallback(callback);
+            IntPtr fnPtr = Marshal.GetFunctionPointerForDelegate(_registeredOverlayCallback);
             _registerOverlayCallback(fnPtr, IntPtr.Zero);
             return true;
         }
@@ -418,6 +418,18 @@ namespace UnityRemix
 
         // prevent GC of overlay delegate
         private static DrawCallback _registeredOverlayCallback;
+
+        private static DrawCallback AttachCallback(DrawCallback callback) => userData =>
+        {
+            try
+            {
+                using (UnityRuntimeThread.Attach()) callback(userData);
+            }
+            catch (Exception ex)
+            {
+                _log?.LogError($"Remix UI callback failed: {ex}");
+            }
+        };
 
         #region Public API — Windows
 

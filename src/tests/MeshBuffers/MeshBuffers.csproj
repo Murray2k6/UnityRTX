@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../MeshBufferDecoder.cs" Link="MeshBufferDecoder.cs" />
+    <Compile Include="../../D3D11ContextGuard.cs" Link="D3D11ContextGuard.cs" />
+  </ItemGroup>
+</Project>

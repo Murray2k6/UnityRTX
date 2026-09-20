@@ -1,58 +1,41 @@
 <Project Sdk="Microsoft.NET.Sdk">
-
   <PropertyGroup>
-    <TargetFramework>netstandard2.1</TargetFramework>
+    <RemixRuntime Condition="'$(RemixRuntime)' == ''">BepInEx5Mono</RemixRuntime>
+    <TargetFramework Condition="'$(RemixRuntime)' != 'BepInEx6IL2CPP'">netstandard2.1</TargetFramework>
+    <TargetFramework Condition="'$(RemixRuntime)' == 'BepInEx6IL2CPP'">net6.0</TargetFramework>
     <AssemblyName>UnityRemix</AssemblyName>
     <Description>RTX Remix integration for Unity</Description>
     <Version>1.0.0</Version>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <LangVersion>latest</LangVersion>
+    <!-- Keep unrelated runtime DLLs out of MSBuild's candidate assembly search. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);artifacts/**;lib/**</DefaultItemExcludes>
+    <ReferencePathRoot Condition="'$(ReferencePathRoot)' == '' and Exists('lib/$(RemixRuntime)')">$(MSBuildProjectDirectory)/lib/$(RemixRuntime)</ReferencePathRoot>
+    <ReferencePathRoot Condition="'$(ReferencePathRoot)' == '' and '$(RemixRuntime)' == 'BepInEx5Mono'">$(MSBuildProjectDirectory)/lib</ReferencePathRoot>
+    <ReferencePathRoot Condition="'$(ReferencePathRoot)' == ''">$(MSBuildProjectDirectory)/lib/$(RemixRuntime)</ReferencePathRoot>
+    <OutputPath>bin/$(Configuration)/$(RemixRuntime)/</OutputPath>
+    <IntermediateOutputPath>obj/$(Configuration)/$(RemixRuntime)/</IntermediateOutputPath>
+    <DefineConstants Condition="'$(RemixRuntime)' == 'BepInEx6Mono'">$(DefineConstants);BEPINEX6_MONO</DefineConstants>
+    <DefineConstants Condition="'$(RemixRuntime)' == 'BepInEx6IL2CPP'">$(DefineConstants);BEPINEX6_IL2CPP</DefineConstants>
+    <DefineConstants Condition="Exists('$(ReferencePathRoot)/UnityEngine.UI.dll') and Exists('$(ReferencePathRoot)/UnityEngine.UIModule.dll')">$(DefineConstants);UNITY_UI</DefineConstants>
+    <DefineConstants Condition="Exists('$(ReferencePathRoot)/UnityEngine.ParticleSystemModule.dll')">$(DefineConstants);UNITY_PARTICLES</DefineConstants>
   </PropertyGroup>
-
   <ItemGroup>
-    <!-- Exclude template/documentation files from build -->
-    <Compile Remove="MIGRATION_TEMPLATE.cs" />
-    <Compile Remove="UltrakillRemixPlugin-backup.cs" />
-    <Compile Remove="UltrakillRemixPlugin.cs.backup" />
-    <Compile Remove="**\*backup*.cs" />
+    <Compile Remove="MIGRATION_TEMPLATE.cs;**/*backup*.cs;tests/**/*.cs;artifacts/**/*.cs;legacy/**/*.cs;obj/**/*.cs;bin/**/*.cs" />
+    <!-- The game provides these assemblies. They must not be deployed with UnityRemix. -->
+    <Reference Include="$(ReferencePathRoot)/UnityEngine.dll;$(ReferencePathRoot)/UnityEngine.CoreModule.dll;$(ReferencePathRoot)/0Harmony.dll"><Private>False</Private></Reference>
+    <Reference Include="$(ReferencePathRoot)/UnityEngine.ParticleSystemModule.dll" Condition="Exists('$(ReferencePathRoot)/UnityEngine.ParticleSystemModule.dll')"><Private>False</Private></Reference>
+    <Reference Include="$(ReferencePathRoot)/UnityEngine.UI.dll;$(ReferencePathRoot)/UnityEngine.UIModule.dll" Condition="Exists('$(ReferencePathRoot)/UnityEngine.UI.dll') and Exists('$(ReferencePathRoot)/UnityEngine.UIModule.dll')"><Private>False</Private></Reference>
+    <Reference Include="$(ReferencePathRoot)/BepInEx.dll" Condition="'$(RemixRuntime)' == 'BepInEx5Mono'"><Private>False</Private></Reference>
+    <Reference Include="$(ReferencePathRoot)/BepInEx.Core.dll;$(ReferencePathRoot)/BepInEx.Unity.Common.dll" Condition="'$(RemixRuntime)' != 'BepInEx5Mono'"><Private>False</Private></Reference>
+    <Reference Include="$(ReferencePathRoot)/BepInEx.Unity.Mono.dll" Condition="'$(RemixRuntime)' == 'BepInEx6Mono'"><Private>False</Private></Reference>
+    <Reference Include="$(ReferencePathRoot)/BepInEx.Unity.IL2CPP.dll;$(ReferencePathRoot)/Il2CppInterop.Runtime.dll;$(ReferencePathRoot)/Il2Cppmscorlib.dll;$(ReferencePathRoot)/Il2CppSystem*.dll" Condition="'$(RemixRuntime)' == 'BepInEx6IL2CPP'"><Private>False</Private></Reference>
   </ItemGroup>
-
-  <ItemGroup>
-    <!-- BepInEx reference - will be provided by the game at runtime -->
-    <Reference Include="BepInEx">
-      <HintPath>lib\BepInEx.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
-    <Reference Include="0Harmony">
-      <HintPath>lib\0Harmony.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
-    
-    <!-- Unity references - will be provided by the game at runtime -->
-    <Reference Include="UnityEngine">
-      <HintPath>lib\UnityEngine.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
-    <Reference Include="UnityEngine.CoreModule">
-      <HintPath>lib\UnityEngine.CoreModule.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
-    <Reference Include="UnityEngine.InputLegacyModule">
-      <HintPath>lib\UnityEngine.InputLegacyModule.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
-    <Reference Include="UnityEngine.UIModule">
-      <HintPath>lib\UnityEngine.UIModule.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
-    <Reference Include="UnityEngine.UI">
-      <HintPath>lib\UnityEngine.UI.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
-  </ItemGroup>
-
-  <Target Name="PostBuild" AfterTargets="PostBuildEvent">
-    <Exec Command="echo Built $(TargetPath)" />
+  <Target Name="ValidateRuntimeReferences" BeforeTargets="ResolveAssemblyReferences">
+    <Error Condition="'$(RemixRuntime)' != 'BepInEx5Mono' and '$(RemixRuntime)' != 'BepInEx6Mono' and '$(RemixRuntime)' != 'BepInEx6IL2CPP'" Text="Unknown RemixRuntime: $(RemixRuntime). Use BepInEx5Mono, BepInEx6Mono, or BepInEx6IL2CPP." />
+    <Error Condition="!Exists('$(ReferencePathRoot)/UnityEngine.CoreModule.dll')" Text="Missing Unity references. Run setup-references.ps1 -UnityPath GAME -Runtime $(RemixRuntime)." />
+    <Error Condition="'$(RemixRuntime)' == 'BepInEx5Mono' and !Exists('$(ReferencePathRoot)/BepInEx.dll')" Text="Missing BepInEx 5 references. Run setup-references.ps1." />
+    <Error Condition="'$(RemixRuntime)' == 'BepInEx6Mono' and !Exists('$(ReferencePathRoot)/BepInEx.Unity.Mono.dll')" Text="Missing BepInEx 6 Mono references. Run setup-references.ps1." />
+    <Error Condition="'$(RemixRuntime)' == 'BepInEx6IL2CPP' and (!Exists('$(ReferencePathRoot)/BepInEx.Unity.IL2CPP.dll') or !Exists('$(ReferencePathRoot)/Il2Cppmscorlib.dll') or !Exists('$(ReferencePathRoot)/Il2CppInterop.Runtime.dll'))" Text="Missing BepInEx 6 IL2CPP / generated interop references. Launch the game with BepInEx once, then run setup-references.ps1." />
   </Target>
-
 </Project>

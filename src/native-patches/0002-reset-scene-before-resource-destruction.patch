@@ -1,0 +1,18 @@
+diff --git a/src/dxvk/rtx_render/rtx_remix_api.cpp b/src/dxvk/rtx_render/rtx_remix_api.cpp
+--- a/src/dxvk/rtx_render/rtx_remix_api.cpp
++++ b/src/dxvk/rtx_render/rtx_remix_api.cpp
+@@ -2710,1 +2710,14 @@
++  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_ResetScene(void) {
++    dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
++    if (!remixDevice) {
++      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
++    }
++    auto devLock = remixDevice->LockDevice();
++    // Order cache invalidation and GPU idle before subsequent resource destroys.
++    remixDevice->EmitCs([](dxvk::DxvkContext* ctx) {
++      ctx->getCommonObjects()->getSceneManager().clear(ctx, true);
++    });
++    return REMIXAPI_ERROR_CODE_SUCCESS;
++  }
++
+   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_RegisterCallbacks(

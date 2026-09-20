@@ -1,0 +1,15 @@
+diff --git a/src/d3d9/d3d9_swapchain_external.cpp b/src/d3d9/d3d9_swapchain_external.cpp
+--- a/src/d3d9/d3d9_swapchain_external.cpp
++++ b/src/d3d9/d3d9_swapchain_external.cpp
+@@ -119,6 +119,11 @@ namespace dxvk {
+       m_context->getCommandList()->trackResource<DxvkAccess::Read>(targetImage);
+     }
+     m_device->submitCommandList(m_context->endRecording(), VK_NULL_HANDLE, VK_NULL_HANDLE);
++    if (m_unityOutputEnabled) {
++      // Unity draws its camera/UI immediately after Present; publishing an older
++      // completed slot would combine two different camera poses in one image.
++      m_device->waitForResource(targetImage, DxvkAccess::Read);
++    }
+     m_parent->m_rtx.OnPresent(targetImage);
+     // NV-DXVK end
+ 

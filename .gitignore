@@ -69,3 +69,19 @@ lib/
 BuildInfo.cs
 
 BepInEx/
+
+# Native binaries, runtime captures, and generated diagnostics
+*.dll
+*.exe
+*.pdb
+*.obj
+*.lib
+*.exp
+*.ilk
+*.zip
+*.dmp
+*.nv-gpudmp
+*.dxvk-cache
+/src/rtx-remix/
+/src/metrics.txt
+/src/nrc_session_log.txt

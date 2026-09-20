@@ -6,11 +6,30 @@ namespace UnityRemix
 {
     /// <summary>
     /// P/Invoke bindings for Remix C API.
-    /// Based on remix_c.h from dxvk-remix v0.6.2.
+    /// Rendering payloads use the Unity bridge's custom ABI, including texture
+    /// upload extensions. The loader negotiates known API families and maps
+    /// their core function tables before validating required Unity capabilities.
     /// </summary>
     public static class RemixAPI
     {
         #region Version Constants
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct remixapi_VramStats
+        {
+            public ulong totalAllocatedBytes, totalUsedBytes, poolRetainedBytes;
+            public ulong usedReplacementGeometryBytes, usedBufferBytes, usedAccelerationStructureBytes;
+            public ulong usedOpacityMicromapBytes, usedMaterialTextureBytes, usedRenderTargetBytes;
+            public ulong driverAllocatedBytes, driverBudgetBytes;
+            public uint forkTextureCacheCount;
+            public ulong usedAppTextureBytes, usedAppBufferBytes;
+        }
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        public delegate remixapi_ErrorCode PFN_remixapi_GetVramStats(out remixapi_VramStats stats);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        public delegate remixapi_ErrorCode PFN_remixapi_RequestVramCompaction();
         
         public const uint REMIXAPI_VERSION_MAJOR = 0;
         public const uint REMIXAPI_VERSION_MINOR = 1000;
@@ -125,25 +144,26 @@ namespace UnityRemix
             REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_ANTI_CULLING = 1 << 5,
             REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_MOTION_BLUR = 1 << 6,
             REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_OPACITY_MICROMAP = 1 << 7,
-            REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_ALPHA_CHANNEL = 1 << 8,
-            REMIXAPI_INSTANCE_CATEGORY_BIT_HIDDEN = 1 << 9,
-            REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE = 1 << 10,
-            REMIXAPI_INSTANCE_CATEGORY_BIT_BEAM = 1 << 11,
-            REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC = 1 << 12,
-            REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_DYNAMIC = 1 << 13,
-            REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_SINGLE_OFFSET = 1 << 14,
-            REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_NO_OFFSET = 1 << 15,
-            REMIXAPI_INSTANCE_CATEGORY_BIT_ALPHA_BLEND_TO_CUTOUT = 1 << 16,
-            REMIXAPI_INSTANCE_CATEGORY_BIT_TERRAIN = 1 << 17,
-            REMIXAPI_INSTANCE_CATEGORY_BIT_ANIMATED_WATER = 1 << 18,
-            REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_MODEL = 1 << 19,
-            REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_BODY = 1 << 20,
-            REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_BAKED_LIGHTING = 1 << 21,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_HIDDEN = 1 << 8,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE = 1 << 9,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_BEAM = 1 << 10,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC = 1 << 11,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_DYNAMIC = 1 << 12,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_SINGLE_OFFSET = 1 << 13,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_NO_OFFSET = 1 << 14,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_ALPHA_BLEND_TO_CUTOUT = 1 << 15,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_TERRAIN = 1 << 16,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_ANIMATED_WATER = 1 << 17,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_MODEL = 1 << 18,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_BODY = 1 << 19,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_BAKED_LIGHTING = 1 << 20,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_ALPHA_CHANNEL = 1 << 21,
             REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_TRANSPARENCY_LAYER = 1 << 22,
             REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER = 1 << 23,
-            REMIXAPI_INSTANCE_CATEGORY_BIT_LEGACY_EMISSIVE = 1 << 24,
-            REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL = 1 << 25,
-            REMIXAPI_INSTANCE_CATEGORY_BIT_FIRST_PERSON_PLAYER_SHADOW = 1 << 26,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS = 1 << 24,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_HAIR_CARDS = 1 << 25,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL = 1 << 26,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_LEGACY_EMISSIVE = 1 << 27,
         }
 
         #endregion
@@ -286,6 +306,22 @@ namespace UnityRemix
         }
 
         [StructLayout(LayoutKind.Sequential)]
+        public struct remixapi_InstanceInfoBlendEXT
+        {
+            public remixapi_StructType sType;
+            public IntPtr pNext;
+            public uint alphaTestEnabled;
+            public byte alphaTestReferenceValue;
+            public uint alphaTestCompareOp, alphaBlendEnabled;
+            public uint srcColorBlendFactor, dstColorBlendFactor, colorBlendOp;
+            public uint textureColorArg1Source, textureColorArg2Source, textureColorOperation;
+            public uint textureAlphaArg1Source, textureAlphaArg2Source, textureAlphaOperation;
+            public uint tFactor, isTextureFactorBlend;
+            public uint srcAlphaBlendFactor, dstAlphaBlendFactor, alphaBlendOp, writeMask;
+            public uint isVertexColorBakedLighting;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
         public struct remixapi_InstanceInfoObjectPickingEXT
         {
             public remixapi_StructType sType;
@@ -332,7 +368,6 @@ namespace UnityRemix
             public remixapi_Float3D radiance;
             public uint isDynamic;       // remixapi_Bool
             public uint ignoreViewModel; // remixapi_Bool
-            public uint ignoreFirstPersonPlayerShadow; // remixapi_Bool
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -401,6 +436,20 @@ namespace UnityRemix
             public byte filterMode;
             public byte wrapModeU;
             public byte wrapModeV;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct remixapi_MaterialInfoTranslucentEXT
+        {
+            public remixapi_StructType sType;
+            public IntPtr pNext;
+            public IntPtr transmittanceTexture;
+            public float refractiveIndex;
+            public remixapi_Float3D transmittanceColor;
+            public float transmittanceMeasurementDistance;
+            public remixapi_Bool thinWallThickness_hasvalue;
+            public float thinWallThickness_value;
+            public remixapi_Bool useDiffuseLayer;
         }
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -636,6 +685,12 @@ namespace UnityRemix
             IntPtr lpFilePart);
 
         private static IntPtr _remixDll = IntPtr.Zero;
+        internal static RemixApiAdapter DetectedAdapter { get; private set; }
+
+        // Optional extension of the native Unity bridge; outside the 0.1000.0
+        // interface table so existing ABI offsets remain unchanged.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        public delegate remixapi_ErrorCode PFN_remixapi_ResetScene();
 
         /// <summary>Handle to the loaded d3d9.dll (Remix runtime). Used by RemixImGui for GetProcAddress.</summary>
         public static IntPtr RemixDllHandle => _remixDll;
@@ -651,6 +706,7 @@ namespace UnityRemix
         {
             remixInterface = new remixapi_Interface();
             remixDll = IntPtr.Zero;
+            DetectedAdapter = null;
 
             if (string.IsNullOrEmpty(dllPath))
             {
@@ -671,24 +727,35 @@ namespace UnityRemix
                 return remixapi_ErrorCode.REMIXAPI_ERROR_CODE_GET_PROC_ADDRESS_FAILURE;
             }
 
-            // Convert to delegate
-            var initFunc = Marshal.GetDelegateForFunctionPointer<PFN_remixapi_InitializeLibrary>(initFuncPtr);
-
-            // Create initialization info with version
-            var info = new remixapi_InitializeLibraryInfo
+            // Negotiate the native contract first, then map its table by field.
+            // Upstream inserts none of the Unity fork's texture/batching functions.
+            var initFunc = Marshal.GetDelegateForFunctionPointer<RemixApiAdapter.Initialize>(initFuncPtr);
+            remixapi_ErrorCode result;
+            try
             {
-                sType = remixapi_StructType.REMIXAPI_STRUCT_TYPE_INITIALIZE_LIBRARY_INFO,
-                pNext = IntPtr.Zero,
-                version = REMIXAPI_VERSION_MAKE(REMIXAPI_VERSION_MAJOR, REMIXAPI_VERSION_MINOR, REMIXAPI_VERSION_PATCH)
-            };
-
-            // Call initialization
-            var result = initFunc(ref info, out remixInterface);
+                result = RemixApiAdapter.Negotiate(initFunc, out var adapter, out remixInterface);
+                DetectedAdapter = adapter;
+            }
+            catch
+            {
+                FreeLibrary(hModule);
+                throw;
+            }
             
             if (result != remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
             {
+                remixInterface = new remixapi_Interface();
                 FreeLibrary(hModule);
                 return result;
+            }
+
+            string missing = MissingUnityCapability(remixInterface, name => GetProcAddress(hModule, name));
+            if (missing != null)
+            {
+                remixInterface = new remixapi_Interface();
+                FreeLibrary(hModule);
+                throw new NotSupportedException("Detected " + DetectedAdapter.Name + " API " + DetectedAdapter.VersionLabel +
+                    ", but this renderer lacks " + missing + ". Unity texture sharing and the native Remix menu require the private renderer included in the complete UnityRemix package.");
             }
 
             remixDll = hModule;
@@ -696,16 +763,29 @@ namespace UnityRemix
             return remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS;
         }
 
+        internal static string MissingUnityCapability(remixapi_Interface api, Func<string, IntPtr> export)
+        {
+            string[] required = { nameof(api.Shutdown), nameof(api.Startup), nameof(api.Present),
+                nameof(api.CreateMaterial), nameof(api.DestroyMaterial), nameof(api.CreateTexture), nameof(api.DestroyTexture),
+                nameof(api.CreateMesh), nameof(api.DestroyMesh), nameof(api.DrawInstance), nameof(api.SetupCamera),
+                nameof(api.CreateLight), nameof(api.DestroyLight), nameof(api.DrawLightInstance), nameof(api.SetConfigVariable) };
+            foreach (string name in required)
+                if ((IntPtr)typeof(remixapi_Interface).GetField(name).GetValue(api) == IntPtr.Zero) return name;
+            foreach (string name in new[] { "remixapi_EnableUnityOutput", "remixapi_SetUnityOutputTargets",
+                "remixapi_GetUnityOutputState", "remixapi_GetUnityRenderEvent", "remixapi_ResetScene",
+                "remixapi_imgui_RegisterDrawCallback", "remixapi_imgui_Begin", "remixapi_imgui_End" })
+                if (export(name) == IntPtr.Zero) return name;
+            return null;
+        }
+
         private static IntPtr LoadRemixLibrary(string dllPath)
         {
-            IntPtr hModule = LoadLibraryW(dllPath);
-            if (HasInitializeLibraryExport(hModule))
-            {
-                return hModule;
-            }
+            if (RemixRuntimeSelection.IsBundled(dllPath))
+                return RemixNativeBundle.Load(dllPath);
 
-            hModule = LoadLibraryExW(
-                dllPath,
+            // Resolve sibling dependencies before the executable's directory.
+            IntPtr hModule = LoadLibraryExW(
+                Path.GetFullPath(dllPath),
                 IntPtr.Zero,
                 LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
             if (HasInitializeLibraryExport(hModule))
@@ -788,31 +868,23 @@ namespace UnityRemix
         }
 
         /// <summary>
-        /// Shutdown and unload the Remix DLL.
-        /// This mirrors remixapi_lib_shutdownAndUnloadRemixDll from remix_c.h
+        /// Shut down Remix and invalidate the API. Keep its module mapped until
+        /// process exit: native Shutdown does not join every background worker.
         /// </summary>
-        public static remixapi_ErrorCode ShutdownAndUnloadRemixDll(ref remixapi_Interface remixInterface, IntPtr remixDll)
+        public static remixapi_ErrorCode ShutdownRemix(ref remixapi_Interface remixInterface)
         {
             if (remixInterface.Shutdown == IntPtr.Zero)
             {
-                if (remixDll != IntPtr.Zero)
-                {
-                    FreeLibrary(remixDll);
-                }
                 return remixapi_ErrorCode.REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
             }
 
             var shutdownFunc = Marshal.GetDelegateForFunctionPointer<PFN_remixapi_Shutdown>(remixInterface.Shutdown);
-            var status = shutdownFunc();
-
-            if (remixDll != IntPtr.Zero)
-            {
-                FreeLibrary(remixDll);
-            }
-
             remixInterface = new remixapi_Interface();
             _remixDll = IntPtr.Zero;
-            return status;
+            // Do not FreeLibrary after Shutdown. A debugger captured a native
+            // worker executing <Unloaded_d3d9.dll> on application exit. The
+            // LoadLibrary reference intentionally survives until process exit.
+            return shutdownFunc();
         }
 
         #endregion

@@ -5,9 +5,11 @@ using System.Threading;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using UnityEngine;
+#if UNITY_UI
 using UnityEngine.UI;
+#endif
 using UnityEngine.Rendering;
-using Unity.Collections.LowLevel.Unsafe;
+
 
 namespace UnityRemix
 {
@@ -20,6 +22,7 @@ namespace UnityRemix
         private readonly RemixCameraHandler cameraHandler;
         private readonly RemixMeshConverter meshConverter;
         private readonly RemixMaterialManager materialManager;
+        private readonly RemixParticleCapture particleCapture;
         
         private readonly ConfigEntry<bool> configUseDistanceCulling;
         private readonly ConfigEntry<float> configMaxRenderDistance;
@@ -470,19 +473,6 @@ namespace UnityRemix
         // Cached GPU skinning data per sharedMesh (bind-pose vertices + bone weights)
         private Dictionary<int, CachedSkinningData> cachedSkinning = new Dictionary<int, CachedSkinningData>(); // keyed by sharedMesh instance ID
         
-        // Pending GPU readback requests
-        private struct PendingReadback
-        {
-            public int skinnedId;
-            public int materialId;
-            public int sharedMeshId;
-            public Matrix4x4 localToWorld;
-            public AsyncGPUReadbackRequest request;
-        }
-        private List<PendingReadback> pendingReadbacks = new List<PendingReadback>();
-        
-        // Track which renderers have had vertexBufferTarget configured
-        private HashSet<int> configuredBufferTargets = new HashSet<int>();
         private HashSet<string> loggedHashDebugMeshes = new HashSet<string>();
         
         // Track logged skinned mesh materials to avoid spam
@@ -513,6 +503,7 @@ namespace UnityRemix
         
         public struct SkinnedMeshData
         {
+            public bool particle;
             public int meshId;
             public ulong remixMeshHash;
             public int materialId;  // Unity material instance ID
@@ -573,6 +564,7 @@ namespace UnityRemix
             this.cameraHandler = cameraHandler;
             this.meshConverter = meshConverter;
             this.materialManager = materialManager;
+            particleCapture = new RemixParticleCapture(logger, materialManager);
             this.configUseDistanceCulling = useDistanceCulling;
             this.configMaxRenderDistance = maxRenderDistance;
             this.configUseVisibilityCulling = useVisibilityCulling;
@@ -589,6 +581,7 @@ namespace UnityRemix
         /// </summary>
         public void InvalidateCaches()
         {
+            particleCapture.Cleanup();
             rendererCacheFrame = -1;
             cachedRenderers.Clear();
             cachedSkinnedRenderers.Clear();
@@ -605,13 +598,23 @@ namespace UnityRemix
             loggedSkinnedMaterials.Clear();
             skinnedRoundRobinIndex = 0;
             persistentSkinnedData.Clear();
-            pendingReadbacks.Clear();
-            configuredBufferTargets.Clear();
+
+
             loggedHashDebugMeshes.Clear();
             cachedTopology.Clear();
             cachedSkinning.Clear();
             persistentStaticInstances.Clear();
             logger.LogInfo("Renderer caches invalidated");
+        }
+
+        public void RefreshRendererTracking() => rendererCacheFrame = -1;
+
+        public void CaptureParticles(FrameState state)
+        {
+            particleCapture.Capture(state, cameraHandler.GetPreferredCamera(),
+                renderer => !IsLayerDisabled(renderer.gameObject.layer) && !IsRendererDisabled(renderer.GetInstanceID()) &&
+                    (!configUseDistanceCulling.Value || (renderer.bounds.center - state.camera.position).sqrMagnitude <=
+                        configMaxRenderDistance.Value * configMaxRenderDistance.Value));
         }
         
         /// <summary>
@@ -624,9 +627,9 @@ namespace UnityRemix
             cachedRendererIds.Clear();
             cachedSkinnedRendererIds.Clear();
             skinnedRoundRobinIndex = 0;
-            // Don't clear configuredBufferTargets — the property persists on the component
+
             
-            var allStatic = UnityEngine.Object.FindObjectsOfType<MeshRenderer>(true);
+            var allStatic = UnityObjectCompat.FindSceneObjects<MeshRenderer>();
             for (int i = 0; i < allStatic.Length; i++)
             {
                 var r = allStatic[i];
@@ -636,7 +639,7 @@ namespace UnityRemix
                 }
             }
 
-            var allSkinned = UnityEngine.Object.FindObjectsOfType<SkinnedMeshRenderer>(true);
+            var allSkinned = UnityObjectCompat.FindSceneObjects<SkinnedMeshRenderer>();
             for (int i = 0; i < allSkinned.Length; i++)
             {
                 var sr = allSkinned[i];
@@ -648,7 +651,7 @@ namespace UnityRemix
             
             rendererCacheFrame = frameCount;
             
-            logger.LogInfo($"Renderer cache refreshed: {cachedRenderers.Count} static, {cachedSkinnedRenderers.Count} skinned");
+            logger.LogDebug($"Renderer cache refreshed: {cachedRenderers.Count} static, {cachedSkinnedRenderers.Count} skinned");
             
             if (configDebugLogInterval.Value > 0)
             {
@@ -1039,7 +1042,7 @@ namespace UnityRemix
                                     matId = HashCombine(matId, mpbHash);
                                 }
                                 submeshMaterialIds.Add(matId);
-                                materialManager.CaptureMaterialTextures(materials[m], matId, mpbEmissive, null, mpbMainTex as Texture2D, mpbColor);
+                                materialManager.CaptureMaterialTextures(materials[m], matId, mpbEmissive, null, UnityObjectCompat.AsTexture2D(mpbMainTex), mpbColor);
                             }
                             else
                             {
@@ -1426,7 +1429,7 @@ namespace UnityRemix
                             string cleanedName = meshName.Replace(" (Instance)", "").Replace(" Instance", "").Replace("(Clone)", "").Trim();
                             cleanedName = System.Text.RegularExpressions.Regex.Replace(cleanedName, @"[\s_-]*[0-9]+$", "");
                             int vertCount = skinned.sharedMesh.vertexCount;
-                            int triCount = skinned.sharedMesh.triangles.Length;
+                            int triCount = skinData.triangles.Length;
                             string boneNames = skinned.bones != null ? string.Join(",", System.Linq.Enumerable.Select(skinned.bones, b => b != null ? b.name : "null")) : "none";
                             logger.LogInfo($"[HashDebug-GPU] '{skinned.name}' meshName='{meshName}' cleanedName='{cleanedName}' verts={vertCount} tris={triCount} baseMeshHash=0x{baseMeshHash:X16} combinedMeshHash=0x{combinedMeshHash:X16} matId={matId} bones=[{boneNames}]");
                         }
@@ -1526,6 +1529,47 @@ namespace UnityRemix
             }
         }
 
+#if UNITY_UI
+        private Action<FrameState, int> captureWeaponUi;
+        private bool checkedWeaponUi;
+#endif
+
+        private void CaptureWeaponCanvasScreens(FrameState state, int frameCount)
+        {
+#if UNITY_UI
+            if (!checkedWeaponUi)
+            {
+                checkedWeaponUi = true;
+                try
+                {
+                    if (Type.GetType("UnityEngine.UI.Graphic, UnityEngine.UI", false) != null)
+                        captureWeaponUi = CreateWeaponUiCapture();
+                }
+                catch (Exception ex) { logger.LogWarning($"Optional Unity UI capture unavailable: {ex.Message}"); }
+            }
+            try { captureWeaponUi?.Invoke(state, frameCount); }
+            catch (Exception ex)
+            {
+                captureWeaponUi = null;
+                logger.LogWarning($"Optional Unity UI capture disabled: {ex.Message}");
+            }
+#endif
+        }
+
+#if UNITY_UI
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        private Action<FrameState, int> CreateWeaponUiCapture() => new WeaponUiCapture(cameraHandler, materialManager).Capture;
+
+        // Keep UI types out of the main capture class's fields and static initializer.
+        private sealed class WeaponUiCapture
+        {
+            private readonly RemixCameraHandler cameraHandler;
+            private readonly RemixMaterialManager materialManager;
+            public WeaponUiCapture(RemixCameraHandler camera, RemixMaterialManager materials)
+            {
+                cameraHandler = camera;
+                materialManager = materials;
+            }
         private static readonly MethodInfo _doMeshGenerationMethod = typeof(Graphic).GetMethod("DoMeshGeneration", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
         private static readonly PropertyInfo _workerMeshProperty = typeof(Graphic).GetProperty("workerMesh", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
         private static Type _tmpTextType;
@@ -1587,7 +1631,7 @@ namespace UnityRemix
         /// <summary>
         /// Captures world-space UI screens attached to viewmodels or camera hierarchy (e.g. digital ammo counters, holographic weapon displays).
         /// </summary>
-        private void CaptureWeaponCanvasScreens(FrameState state, int frameCount)
+        public void Capture(FrameState state, int frameCount)
         {
             Camera mainCam = cameraHandler?.GetPreferredCamera();
             if (mainCam == null)
@@ -1661,13 +1705,21 @@ namespace UnityRemix
                 Color32[] colors = null;
                 int[] tris = null;
 
-                if (mesh != null && mesh.vertexCount > 0)
+                if (mesh != null && mesh.vertexCount > 0 && mesh.isReadable)
                 {
                     verts = mesh.vertices;
                     normals = mesh.normals;
                     uvs = mesh.uv;
                     colors = mesh.colors32;
                     tris = mesh.triangles;
+                }
+                else if (mesh != null && mesh.vertexCount > 0 &&
+                         NativeMeshReader.ReadMeshFromGPU(mesh, out verts, out normals, out uvs, out var uiSubMeshes))
+                {
+                    var uiTriangles = new List<int>();
+                    foreach (var subMesh in uiSubMeshes)
+                        if (subMesh != null) uiTriangles.AddRange(subMesh);
+                    tris = uiTriangles.ToArray();
                 }
 
                 if (verts == null || verts.Length == 0 || tris == null || tris.Length == 0)
@@ -1728,7 +1780,7 @@ namespace UnityRemix
                 if (mat == null)
                     continue;
 
-                Texture2D mainTex = g.mainTexture as Texture2D;
+                Texture2D mainTex = UnityObjectCompat.AsTexture2D(g.mainTexture);
 
                 Color32 c32 = col;
                 int qR = (c32.r >> 3);
@@ -1768,6 +1820,10 @@ namespace UnityRemix
             }
         }
         
+
+        }
+#endif
+
         /// <summary>
         /// Cache UVs, triangles, and vertex buffer layout for a sharedMesh. Called once per unique mesh.
         /// </summary>
@@ -1775,11 +1831,12 @@ namespace UnityRemix
         {
             try
             {
-                var uvCoords = sharedMesh.uv;
+                bool readable = sharedMesh.isReadable;
+                var uvCoords = readable ? sharedMesh.uv : null;
                 
                 // Combine all submesh triangles
                 var allTris = new List<int>();
-                for (int i = 0; i < sharedMesh.subMeshCount; i++)
+                for (int i = 0; readable && i < sharedMesh.subMeshCount; i++)
                 {
                     if (sharedMesh.GetTopology(i) != MeshTopology.Triangles)
                         continue;
@@ -1790,7 +1847,7 @@ namespace UnityRemix
                 
                 if (allTris.Count == 0 || allTris.Count % 3 != 0)
                 {
-                    if (!sharedMesh.isReadable)
+                    if (!readable)
                     {
                         // Mesh not readable — can't get triangles directly.
                         // Cache vertex buffer layout now; topology will be completed from first BakeMesh.
@@ -1906,6 +1963,9 @@ namespace UnityRemix
                 float[] blendWeights = new float[BONES_PER_VERTEX * vertexCount];
                 uint[] blendIndices = new uint[BONES_PER_VERTEX * vertexCount];
                 
+                // IL2CPP interop can omit NativeArray<BoneWeight1> accessors.
+                // Use the four-weight API there, which matches Remix's limit.
+#if !BEPINEX6_IL2CPP
                 try
                 {
                     var bonesPerVertex = mesh.GetBonesPerVertex();
@@ -1929,6 +1989,7 @@ namespace UnityRemix
                     }
                 }
                 catch
+#endif
                 {
                     // Legacy fallback: BoneWeight per vertex (always exactly 4)
                     try
@@ -2120,67 +2181,6 @@ namespace UnityRemix
         }
         
         /// <summary>
-        /// Try to issue an async GPU readback for a skinned mesh renderer's vertex buffer.
-        /// Returns true if request was issued, false if GPU readback not possible for this renderer.
-        /// </summary>
-        private bool TryIssueGPUReadback(SkinnedMeshRenderer skinned, int skinnedId, int sharedMeshId, int matId, Matrix4x4 localToWorld, bool doLog)
-        {
-            try
-            {
-                // Ensure vertex buffer is readable — must be set before the GPU skins this renderer,
-                // so we configure it and skip readback this frame (buffer won't exist yet).
-                // Unity 2019 lacks vertexBufferTarget and forceMatrixRecalculationPerRender —
-                // MissingMethodException will be caught and BakeMesh fallback used instead.
-                if (!configuredBufferTargets.Contains(skinnedId))
-                {
-                    skinned.vertexBufferTarget |= GraphicsBuffer.Target.Raw;
-                    skinned.forceMatrixRecalculationPerRender = true;
-                    configuredBufferTargets.Add(skinnedId);
-                    logger.LogInfo($"  GPU readback: configured vertexBufferTarget for '{skinned.name}' (id={skinnedId}), deferring to next frame");
-                    return false;
-                }
-                
-                var buffer = skinned.GetVertexBuffer();
-                if (buffer == null || !buffer.IsValid())
-                {
-                    logger.LogInfo($"  GPU readback: GetVertexBuffer() returned {(buffer == null ? "null" : "invalid")} for '{skinned.name}' (id={skinnedId})");
-                    buffer?.Dispose();
-                    return false;
-                }
-                
-                var request = AsyncGPUReadback.Request(buffer);
-                buffer.Dispose();
-                
-                pendingReadbacks.Add(new PendingReadback
-                {
-                    skinnedId = skinnedId,
-                    materialId = matId,
-                    sharedMeshId = sharedMeshId,
-                    localToWorld = localToWorld,
-                    request = request
-                });
-                
-                return true;
-            }
-            catch (MissingMethodException)
-            {
-                // Unity 2019: vertexBufferTarget / GetVertexBuffer / forceMatrixRecalculationPerRender
-                // don't exist. Silently fall through to BakeMesh — log once per renderer.
-                if (!configuredBufferTargets.Contains(skinnedId))
-                {
-                    logger.LogInfo($"  GPU readback: not available for '{skinned.name}' (Unity 2019) — using BakeMesh");
-                    configuredBufferTargets.Add(skinnedId); // prevent repeated log
-                }
-                return false;
-            }
-            catch (Exception ex)
-            {
-                logger.LogWarning($"  GPU readback: exception for '{skinned.name}' (id={skinnedId}): {ex.Message}");
-                return false;
-            }
-        }
-        
-        /// <summary>
         /// BakeMesh fallback: CPU re-skin a single skinned mesh.
         /// </summary>
         private bool BakeSingleMesh(SkinnedMeshRenderer skinned, int skinnedId, int matId, Matrix4x4 localToWorld, bool doLog)
@@ -2265,7 +2265,7 @@ namespace UnityRemix
                     string cleanedName = meshName.Replace(" (Instance)", "").Replace(" Instance", "").Replace("(Clone)", "").Trim();
                     cleanedName = System.Text.RegularExpressions.Regex.Replace(cleanedName, @"[\s_-]*[0-9]+$", "");
                     int vertCount = skinned.sharedMesh.vertexCount;
-                    int triCount = skinned.sharedMesh.triangles.Length;
+                    int triCount = tris.Length;
                     string boneNames = skinned.bones != null ? string.Join(",", System.Linq.Enumerable.Select(skinned.bones, b => b != null ? b.name : "null")) : "none";
                     logger.LogInfo($"[HashDebug-BakeMesh] '{skinned.name}' meshName='{meshName}' cleanedName='{cleanedName}' verts={vertCount} tris={triCount} baseMeshHash=0x{baseMeshHash:X16} combinedMeshHash=0x{combinedMeshHash:X16} matId={matId} bones=[{boneNames}]");
                 }
@@ -2323,20 +2323,11 @@ namespace UnityRemix
             if (materials == null || materials.Length == 0)
                 return 0;
             
-            string[] textureProps = { "_MainTex", "_BaseMap", "_BaseColorMap", "_AlbedoTex" };
-            
             foreach (var mat in materials)
             {
                 if (mat == null) continue;
-                bool hasTexture = mat.mainTexture != null;
-                if (!hasTexture)
-                {
-                    foreach (var prop in textureProps)
-                    {
-                        if (mat.HasProperty(prop) && mat.GetTexture(prop) != null)
-                        { hasTexture = true; break; }
-                    }
-                }
+                string albedoProperty = MaterialTextureProperties.FindAlbedo(mat);
+                bool hasTexture = albedoProperty != null && mat.GetTexture(albedoProperty) != null;
                 if (hasTexture) { bestMaterial = mat; break; }
             }
             
@@ -2409,6 +2400,7 @@ namespace UnityRemix
         /// </summary>
         public void Cleanup()
         {
+            particleCapture.Cleanup();
             foreach (var mesh in bakedMeshes.Values)
             {
                 if (mesh != null)
@@ -2417,8 +2409,8 @@ namespace UnityRemix
                 }
             }
             bakedMeshes.Clear();
-            pendingReadbacks.Clear();
-            configuredBufferTargets.Clear();
+
+
             cachedTopology.Clear();
         }
     }

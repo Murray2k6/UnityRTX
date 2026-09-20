@@ -1,5 +1,5 @@
 using System;
-using BepInEx;
+
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using UnityEngine;
@@ -7,11 +7,10 @@ using UnityEngine;
 namespace UnityRemix
 {
     /// <summary>
-    /// Main BepInEx plugin - orchestrates all Remix components
-    /// Refactored from 3309 lines to ~350 lines of orchestration code
+    /// Shared managed runtime - orchestrates all Remix components
+    /// Hosted by the Mono or IL2CPP BepInEx entry point.
     /// </summary>
-    [BepInPlugin(PluginGUID, PluginName, PluginVersion)]
-    public class UnityRemixPlugin : BaseUnityPlugin
+    public sealed class UnityRemixPlugin
     {
         public const string PluginGUID = "com.Unity.remix";
         public const string PluginName = "Unity RTX Remix";
@@ -38,6 +37,7 @@ namespace UnityRemix
         private ConfigEntry<bool> configCaptureTextures;
         private ConfigEntry<bool> configCaptureMaterials;
         private ConfigEntry<bool> configVerboseTextureLogging;
+        private ConfigEntry<int> configMaxTextureDimension;
         
         // Scene mesh scanner settings
         private ConfigEntry<bool> configEnableSceneScan;
@@ -65,37 +65,61 @@ namespace UnityRemix
         private RemixDebugHUD debugHUD;
         
         private int frameCount = 0;
-        private static bool isQuitting = false;
+        private bool stopped;
+        private bool started;
+        private System.Threading.Tasks.Task<RemixRuntimeProbe.Report> runtimeDetection;
+        private readonly System.Threading.CancellationTokenSource detectionCancellation = new System.Threading.CancellationTokenSource();
+        private bool sceneResourcesDirty = true;
+        private readonly System.Collections.Generic.List<UnityEngine.SceneManagement.Scene> pendingAdditiveScenes =
+            new System.Collections.Generic.List<UnityEngine.SceneManagement.Scene>();
+        private readonly ConfigFile Config;
+#if BEPINEX6_IL2CPP
+        private UnityEngine.Events.UnityAction<UnityEngine.SceneManagement.Scene, UnityEngine.SceneManagement.LoadSceneMode> sceneLoadedHandler;
+        private UnityEngine.Events.UnityAction<UnityEngine.SceneManagement.Scene> sceneUnloadedHandler;
+#endif
+
+        public UnityRemixPlugin(ConfigFile config, ManualLogSource logger)
+        {
+            Config = config;
+            LogSource = logger;
+        }
         
         // Shared lock for all Remix API calls to prevent deadlocks
         private static readonly object remixApiLock = new object();
         
-        void Awake()
+        public void Start()
         {
-            LogSource = Logger;
+            if (started || stopped) return;
+            if (!RuntimeCompatibility.Check(LogSource)) { stopped = true; return; }
+            started = true;
             LogSource.LogInfo($"Plugin {PluginName} v{PluginVersion} is loading!");
             
             // Initialize configuration
             InitializeConfig();
             
-            // Persist across scenes
-            DontDestroyOnLoad(this.gameObject);
-            hideFlags = HideFlags.HideAndDontSave;
-            
-            LogSource.LogInfo($"GameObject: {gameObject.name}, Active: {gameObject.activeSelf}, Enabled: {enabled}");
-            
-            // Subscribe to scene events
+            // Retain the converted delegate so IL2CPP can unsubscribe the same instance.
+#if BEPINEX6_IL2CPP
+            sceneLoadedHandler = (Action<UnityEngine.SceneManagement.Scene, UnityEngine.SceneManagement.LoadSceneMode>)OnSceneLoaded;
+            UnityEngine.SceneManagement.SceneManager.sceneLoaded += sceneLoadedHandler;
+            sceneUnloadedHandler = (Action<UnityEngine.SceneManagement.Scene>)OnSceneUnloaded;
+            UnityEngine.SceneManagement.SceneManager.sceneUnloaded += sceneUnloadedHandler;
+#else
             UnityEngine.SceneManagement.SceneManager.sceneLoaded += OnSceneLoaded;
-            
+            UnityEngine.SceneManagement.SceneManager.sceneUnloaded += OnSceneUnloaded;
+#endif
             // Load Remix API
             try
             {
-                LogSource.LogInfo("Loading Remix API interface...");
-                LoadRemixInterface();
+                LogSource.LogInfo("Detecting installed Remix API versions...");
+                string gameRoot = System.IO.Path.GetDirectoryName(Application.dataPath);
+                string bepinexRoot = BepInEx.Paths.BepInExRootPath;
+                var cancellation = detectionCancellation.Token;
+                runtimeDetection = System.Threading.Tasks.Task.Run(() => RemixRuntimeProbe.Inspect(gameRoot, bepinexRoot, cancellation));
             }
             catch (Exception ex)
             {
                 LogSource.LogError($"Failed to load Remix interface: {ex}");
+                Shutdown();
             }
         }
         
@@ -170,7 +194,7 @@ namespace UnityRemix
                 "Enable runtime scene scanning to find all static level geometry (including inactive objects). No external bake tool needed.");
 
             configSceneScanActiveOnly = Config.Bind("SceneScan", "ActiveRenderersOnly", false,
-                "Only scan and draw renderers that are currently active. Prevents ghost geometry from inactive scene variants (e.g. The Stanley Parable). Disable for games where inactive geometry should remain visible.");
+                "Only preload meshes from active renderers. Disabled renderers remain hidden regardless of this setting; scanning inactive objects makes their geometry ready when the game enables them.");
 
             configPersistDisabledRenderers = Config.Bind("Rendering", "PersistDisabledRenderers", false,
                 "Keep drawing static meshes after their renderer is deactivated by the game. Enable for games that temporarily deactivate visible geometry (e.g. ULTRAKILL CyberGrind).");
@@ -188,8 +212,44 @@ namespace UnityRemix
         private void OnSceneLoaded(UnityEngine.SceneManagement.Scene scene, UnityEngine.SceneManagement.LoadSceneMode mode)
         {
             LogSource.LogInfo($"Scene loaded: {scene.name}, mode: {mode}");
-            
-            // Reset camera tracking
+            if (mode == UnityEngine.SceneManagement.LoadSceneMode.Additive && !sceneResourcesDirty)
+                pendingAdditiveScenes.Add(scene);
+            else
+                sceneResourcesDirty = true;
+            cameraHandler?.ResetTracking();
+            frameCapture?.RefreshRendererTracking();
+        }
+
+        private void OnSceneUnloaded(UnityEngine.SceneManagement.Scene scene)
+        {
+            sceneResourcesDirty = true;
+        }
+
+        private void RefreshSceneResources()
+        {
+            if (!deviceRegistered) return;
+            if (!sceneResourcesDirty)
+            {
+                // Additive loads retain the existing scene and its allocations.
+                if (configEnableSceneScan.Value)
+                    foreach (var added in pendingAdditiveScenes)
+                        if (added.IsValid() && added.isLoaded) sceneMeshScanner.OnSceneLoaded(added);
+                pendingAdditiveScenes.Clear();
+                return;
+            }
+            sceneResourcesDirty = false;
+            pendingAdditiveScenes.Clear();
+            // Coalesce load/unload callbacks at the next Unity update. Discard
+            // queued frames, then release in mesh -> material -> texture order.
+            renderThread.ResetSceneResources(() =>
+            {
+                frameCapture.InvalidateCaches();
+                frameCapture.Cleanup();
+                sceneMeshScanner.ClearData();
+                meshConverter.Cleanup();
+                materialManager.Cleanup();
+                lightConverter.ClearCache();
+            });
             cameraHandler?.ResetTracking();
             
             // List cameras if enabled
@@ -198,14 +258,15 @@ namespace UnityRemix
                 cameraHandler.ListAvailableCameras();
             }
             
-            // Invalidate caches
-            frameCapture?.InvalidateCaches();
-            lightConverter?.ClearCache();
-            sceneMeshScanner?.ClearData();
-            
-            // Trigger scene scan
+            // Rebuild the union of loaded scenes, including additive scenes.
             if (configEnableSceneScan.Value)
-                sceneMeshScanner?.OnSceneLoaded(scene);
+            {
+                for (int i = 0; i < UnityEngine.SceneManagement.SceneManager.sceneCount; i++)
+                {
+                    var scene = UnityEngine.SceneManagement.SceneManager.GetSceneAt(i);
+                    if (scene.IsValid() && scene.isLoaded) sceneMeshScanner.OnSceneLoaded(scene);
+                }
+            }
             
             // Refresh light cache on scene load
             lightConverter?.RefreshLightCache();
@@ -213,47 +274,45 @@ namespace UnityRemix
             // Refresh camera snapshots for UI
             cameraHandler?.RefreshCameraSnapshots();
             
-            // Keep device registration progressing across scene transitions.
-            AdvanceDeviceRegistration();
-            
-            // Capture initial data
-            if (configUseGameGeometry.Value && deviceRegistered && frameCapture != null)
-            {
-                var initialState = new RemixFrameCapture.FrameState();
-                frameCapture.CaptureStaticMeshes(initialState, frameCount);
-                renderThread?.UpdateFrameState(initialState);
-            }
         }
         
-        private void LoadRemixInterface()
+        private void LoadRemixInterface(string dllPath)
         {
             LogSource.LogInfo("Loading Remix API interface...");
-            
-            // Find d3d9.dll
-            string gamePath = Application.dataPath;
-            string dllPath = System.IO.Path.Combine(
-                System.IO.Path.GetDirectoryName(gamePath),
-                "d3d9.dll"
-            );
             
             LogSource.LogInfo($"Looking for Remix DLL at: {dllPath}");
             
             if (!System.IO.File.Exists(dllPath))
             {
                 LogSource.LogError($"Remix DLL not found at {dllPath}");
-                LogSource.LogInfo("Please place the RTX Remix d3d9.dll in the game root folder.");
+                LogSource.LogInfo("Install the complete UnityRemix package, including its private native renderer.");
+                Shutdown();
                 return;
             }
             
             // Load API
-            var result = RemixAPI.InitializeRemixAPI(dllPath, out remixInterface, out remixDll);
+            RemixAPI.remixapi_ErrorCode result;
+            try
+            {
+                result = RemixAPI.InitializeRemixAPI(dllPath, out remixInterface, out remixDll);
+            }
+            catch (Exception exception)
+            {
+                LogSource.LogError("Could not load the UnityRemix native renderer: " + exception.Message);
+                Shutdown();
+                return;
+            }
             if (result != RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
             {
                 LogSource.LogError($"Failed to load Remix API: {result}");
+                if (result == RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_INCOMPATIBLE_VERSION)
+                    LogSource.LogError("No matching API contract was found (known families: 0.2, 0.4, 0.5, 0.6 and Unity bridge 0.1000). Install the complete UnityRemix package.");
+                Shutdown();
                 return;
             }
             
-            LogSource.LogInfo("Remix API loaded successfully!");
+            LogSource.LogInfo($"Remix API loaded successfully ({(RemixRuntimeSelection.IsBundled(dllPath) ? "private renderer" : "legacy game-root renderer")}).");
+            LogSource.LogInfo($"Remix bindings selected automatically: {RemixAPI.DetectedAdapter.Name} API {RemixAPI.DetectedAdapter.VersionLabel}; native Remix menu and Unity texture sharing available.");
             LogSource.LogInfo($"Interface pointers - CreateMesh: {remixInterface.CreateMesh}, DrawInstance: {remixInterface.DrawInstance}");
             
             remixInitialized = true;
@@ -268,6 +327,10 @@ namespace UnityRemix
         private void InitializeComponents()
         {
             LogSource.LogInfo("Initializing components...");
+            configMaxTextureDimension = Config.Bind("Performance", "MaxTextureDimension", 2048,
+                new ConfigDescription("Maximum dimension of textures copied into Remix. Limits the extra GPU/CPU memory needed alongside Unity. 0 keeps the original size. Changing this requires a scene reload.",
+                    new AcceptableValueRange<int>(0, 16384)));
+            LogSource.LogInfo($"Remix texture capture maximum dimension: {configMaxTextureDimension.Value} (0 = original size).");
             
             // Create all components with dependencies
             textureCategoryManager = new TextureCategoryManager();
@@ -298,7 +361,8 @@ namespace UnityRemix
                 configCaptureMaterials,
                 configVerboseTextureLogging,
                 remixInterface,
-                remixApiLock
+                remixApiLock,
+                configMaxTextureDimension
             );
             
             meshConverter = new RemixMeshConverter(
@@ -370,6 +434,7 @@ namespace UnityRemix
         }
         
         private bool renderThreadStarted = false;
+        private RemixUnityDisplay unityDisplay;
 
         private void AdvanceDeviceRegistration()
         {
@@ -417,12 +482,38 @@ namespace UnityRemix
             renderThread?.Start();
         }
         
-        void Update()
+        public void Update()
         {
+            if (stopped || !started) return;
+            if (runtimeDetection != null)
+            {
+                if (!runtimeDetection.IsCompleted) return;
+                var completed = runtimeDetection;
+                runtimeDetection = null;
+                try
+                {
+                    var report = completed.GetAwaiter().GetResult();
+                    foreach (string message in report.Messages) LogSource.LogInfo(message);
+                    if (report.Error != null) throw new InvalidOperationException(report.Error);
+                    // All Unity/native renderer initialization stays on the Unity thread.
+                    LoadRemixInterface(report.LibraryPath);
+                }
+                catch (Exception error)
+                {
+                    LogSource.LogError("Remix initialization stopped: " + error.Message);
+                    Shutdown();
+                }
+                if (stopped) return;
+            }
+            if (renderThread != null && (renderThread.HasStopped || windowManager.CloseRequested))
+            {
+                Shutdown();
+                return;
+            }
             frameCount++;
 
             AdvanceDeviceRegistration();
-            
+            RefreshSceneResources();
             // Rescan for async-loaded meshes (Addressables, etc.)
             if (configEnableSceneScan.Value)
                 sceneMeshScanner?.Update(Time.unscaledDeltaTime);
@@ -431,28 +522,41 @@ namespace UnityRemix
             // after the camera has been resolved by CaptureStaticMeshes
         }
         
-        void LateUpdate()
+        private int lastCapturedUnityFrame = -1;
+        private Camera lastCaptureCamera;
+        public void CaptureBeforeCamera(Camera camera)
         {
-            // Capture frame data on main thread
-            UpdateFromPersistent();
-        }
-        
-        void OnApplicationQuit()
-        {
-            LogSource.LogInfo("Application quitting...");
-            isQuitting = true;
-        }
-        
-        public void UpdateFromPersistent()
-        {
-            if (!remixInitialized)
+            if (stopped || !remixInitialized)
                 return;
+
+            // Reflection, shadow, UI and stacked cameras must not advance Remix
+            // history independently of the selected world camera.
+            if (camera == null || camera != cameraHandler?.GetPreferredCamera() ||
+                lastCapturedUnityFrame == Time.frameCount) return;
 
             AdvanceDeviceRegistration();
             if (!deviceRegistered)
                 return;
+            lastCapturedUnityFrame = Time.frameCount;
+            if (lastCaptureCamera != camera)
+            {
+                lastCaptureCamera = camera;
+                var expectedView = Matrix4x4.Scale(new Vector3(1, 1, -1)) * camera.transform.worldToLocalMatrix;
+                var expectedProjection = Matrix4x4.Perspective(camera.fieldOfView, camera.aspect, camera.nearClipPlane, camera.farClipPlane);
+                float viewDifference = 0, projectionDifference = 0;
+                var actualView = camera.worldToCameraMatrix;
+                var actualProjection = camera.projectionMatrix;
+                for (int row = 0; row < 4; row++)
+                    for (int column = 0; column < 4; column++)
+                    {
+                        viewDifference = Math.Max(viewDifference, Math.Abs(actualView[row, column] - expectedView[row, column]));
+                        projectionDifference = Math.Max(projectionDifference, Math.Abs(actualProjection[row, column] - expectedProjection[row, column]));
+                    }
+                LogSource.LogInfo($"[Camera capture] Before-render camera '{camera.name}' ({camera.GetInstanceID()}), Unity frame {Time.frameCount}; view difference={viewDifference:F6}, projection difference={projectionDifference:F6}.");
+            }
+            RefreshSceneResources();
             
-            if (frameCount % 300 == 1 && LogSource != null)
+            if (configDebugLogInterval.Value > 0 && frameCount % configDebugLogInterval.Value == 1 && LogSource != null)
             {
                 LogSource.LogInfo($"UpdateFromPersistent: frame={frameCount}, initialized={remixInitialized}, deviceReg={deviceRegistered}");
             }
@@ -481,6 +585,7 @@ namespace UnityRemix
                 
                 // Capture skinned meshes
                 frameCapture.CaptureSkinnedMeshes(nextState, frameCount);
+                frameCapture.CaptureParticles(nextState);
                 
                 // Update scene scan visibility with the camera position resolved by CaptureStaticMeshes
                 if (sceneMeshScanner != null)
@@ -497,58 +602,78 @@ namespace UnityRemix
                 // Send to render thread (mesh creation moved to render thread to avoid deadlocks)
                 renderThread.UpdateFrameState(nextState);
             }
+            else
+            {
+                renderThread?.UpdateFrameState(new RemixFrameCapture.FrameState { frameCount = frameCount });
+            }
 
             // Update debug HUD snapshot after all frame data is captured
             debugHUD?.UpdateSnapshot();
+            try
+            {
+                if (unityDisplay == null) unityDisplay = new RemixUnityDisplay(LogSource);
+                unityDisplay.Update(cameraHandler?.CurrentCamera);
+                renderThread?.SubmitMainThreadFrame();
+                unityDisplay.CopyLatestFrame();
+            }
+            catch (Exception ex)
+            {
+                LogSource.LogError($"Unity shared output failed: {ex}");
+                Shutdown();
+            }
         }
         
-        void OnDestroy()
+        public void Shutdown()
         {
-            if (!isQuitting)
+            if (stopped) return;
+            stopped = true;
+            detectionCancellation.Cancel();
+#if BEPINEX6_IL2CPP
+            if (sceneLoadedHandler != null)
+                UnityEngine.SceneManagement.SceneManager.sceneLoaded -= sceneLoadedHandler;
+            sceneLoadedHandler = null;
+            if (sceneUnloadedHandler != null)
+                UnityEngine.SceneManagement.SceneManager.sceneUnloaded -= sceneUnloadedHandler;
+            sceneUnloadedHandler = null;
+#else
+            if (started)
             {
-                LogSource.LogWarning("OnDestroy called but app not quitting - recreating plugin...");
-                
-                var newGo = new GameObject("UnityRemix_Persistent");
-                GameObject.DontDestroyOnLoad(newGo);
-                newGo.hideFlags = HideFlags.HideAndDontSave;
-                var newBehaviour = newGo.AddComponent<RemixPersistentBehaviour>();
-                newBehaviour.Initialize(this);
-                
-                return;
+                UnityEngine.SceneManagement.SceneManager.sceneLoaded -= OnSceneLoaded;
+                UnityEngine.SceneManagement.SceneManager.sceneUnloaded -= OnSceneUnloaded;
             }
-            
-            LogSource.LogInfo("OnDestroy called during quit - cleaning up...");
-            UnityEngine.SceneManagement.SceneManager.sceneLoaded -= OnSceneLoaded;
+#endif
             CleanupRemix();
         }
-        
-        public static void SetQuitting()
-        {
-            isQuitting = true;
-        }
-        
         private void CleanupRemix()
         {
             if (!remixInitialized) return;
             
             LogSource.LogInfo("Cleaning up Remix...");
+            unityDisplay?.Dispose();
+            unityDisplay = null;
             
-            // Unregister ImGui callback
+            // Stop render thread
+            if (renderThread != null && !renderThread.Stop())
+            {
+                LogSource.LogError("Remix worker is still stopping; native resources remain loaded to avoid freeing active callbacks.");
+                return;
+            }
+            deviceRegistered = false;
+
             RemixImGui.UnregisterDrawCallback();
             RemixImGui.UnregisterOverlayCallback();
             
-            // Stop render thread
-            renderThread?.Stop();
-            
             // Cleanup all components
-            materialManager?.Cleanup();
+            sceneMeshScanner?.ClearData();
             meshConverter?.Cleanup();
+            materialManager?.Cleanup();
             frameCapture?.Cleanup();
             lightConverter?.ClearCache();
-            windowManager?.DestroyRemixWindow();
             
             // Shutdown Remix API
-            RemixAPI.ShutdownAndUnloadRemixDll(ref remixInterface, remixDll);
+            var shutdownStatus = RemixAPI.ShutdownRemix(ref remixInterface);
+            if (shutdownStatus != RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
+                LogSource.LogWarning($"Remix shutdown returned {shutdownStatus}; native module remains mapped until process exit.");
             remixDll = IntPtr.Zero;
             remixInitialized = false;
             

@@ -1,0 +1,23 @@
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -1003,6 +1003,6 @@ if dxvk_is_ninja or dxvk_is_woa_ec
+   endif
+ endif # dxvk_is_ninja
+ 
+-if fs.is_dir('nv-private')
++if fs.is_file('nv-private/meson.build')
+   subdir('nv-private')
+ endif
+diff --git a/tests/rtx/meson.build b/tests/rtx/meson.build
+--- a/tests/rtx/meson.build
++++ b/tests/rtx/meson.build
+@@ -4,7 +4,7 @@ subdir('unit')
+ if target_machine.cpu() != 'armv8'
+ 
+ dxvkrt_test_root = meson.global_source_root().replace('\\', '/') + '/tests/rtx/dxvk_rt_testing/'
+-if fs.is_dir('dxvk_rt_testing')
++if fs.is_file('dxvk_rt_testing/meson.build')
+   subdir('dxvk_rt_testing')
+ endif
+ 

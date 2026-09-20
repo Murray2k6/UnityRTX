@@ -1,0 +1,774 @@
+diff --git a/src/d3d9/d3d9_rtx.cpp b/src/d3d9/d3d9_rtx.cpp
+index 5701e7a..2a68850 100644
+--- a/src/d3d9/d3d9_rtx.cpp
++++ b/src/d3d9/d3d9_rtx.cpp
+@@ -192,7 +192,7 @@ namespace dxvk {
+     assert(geoData.positionBuffer.offset() % 4 == 0);
+ 
+     if (BoundShaderHas(vertexShader, DxsoUsage::Texcoord, false)
+-        && (useVertexCapturedTexcoords() || !geoData.texcoordBuffer.defined() || !RtxGeometryUtils::isTexcoordFormatValid(geoData.texcoordBuffer.vertexFormat()))) {
++        && ((isUnitySession() && shaderUsesVertexColor()) || useVertexCapturedTexcoords() || !geoData.texcoordBuffer.defined() || !RtxGeometryUtils::isTexcoordFormatValid(geoData.texcoordBuffer.vertexFormat()))) {
+       // By default we only capture VS output texcoords when the input vertex declaration didn't
+       // already provide them.  Overriding valid input texcoords with the VS output is opt-in
+       // (useVertexCapturedTexcoords), since the data a VS writes to the :TEXCOORD attribute isn't
+@@ -203,7 +203,8 @@ namespace dxvk {
+     }
+ 
+     // Check if we should/can get normals.  We don't see a lot of games sending normals to pixel shader, so we must capture from the IA output (or Vertex input)
+-    if ((BoundShaderHas(vertexShader, DxsoUsage::Normal, false) || BoundShaderHas(vertexShader, DxsoUsage::Normal, true)) && useVertexCapturedNormals()) {
++    if (!m_activeDrawCallState.unityWaterMaterial.has_value() &&
++        (BoundShaderHas(vertexShader, DxsoUsage::Normal, false) || BoundShaderHas(vertexShader, DxsoUsage::Normal, true)) && useVertexCapturedNormals()) {
+       const uint32_t normalOffset = offsetof(CapturedVertex, normal0);
+       geoData.normalBuffer = RasterBuffer(slice, normalOffset, stride, VK_FORMAT_R32G32B32_SFLOAT);
+       assert(geoData.normalBuffer.offset() % 4 == 0);
+@@ -212,7 +213,8 @@ namespace dxvk {
+     }
+ 
+     // Check if we should/can get colors
+-    if (BoundShaderHas(vertexShader, DxsoUsage::Color, false) && d3d9State().pixelShader.ptr() == nullptr) {
++    if (BoundShaderHas(vertexShader, DxsoUsage::Color, false) &&
++        (d3d9State().pixelShader.ptr() == nullptr || (isUnitySession() && shaderUsesVertexColor()))) {
+       const uint32_t colorOffset = offsetof(CapturedVertex, color0);
+       geoData.color0Buffer = RasterBuffer(slice, colorOffset, stride, VK_FORMAT_B8G8R8A8_UNORM);
+       assert(geoData.color0Buffer.offset() % 4 == 0);
+@@ -288,7 +290,7 @@ namespace dxvk {
+         break;
+       case D3DDECLUSAGE_COLOR:
+         if (element.UsageIndex == 0 &&
+-            !RtxOptions::ignoreAllVertexColorBakedLighting()) {
++            (isUnitySession() || !RtxOptions::ignoreAllVertexColorBakedLighting())) {
+           const XXH64_hash_t textureHash = m_activeDrawCallState.materialData.colorTextures[0].getImageHash();
+           // Allow vertex colors for textures explicitly in the allowBakedLightingTextures list
+           const bool isExplicitlyAllowed = lookupHash(RtxOptions::allowBakedLightingTextures(), textureHash);
+@@ -299,7 +301,7 @@ namespace dxvk {
+                                       lookupHash(RtxOptions::nonOffsetDecalTextures(), textureHash);
+           // Also allow vertex colors for particle textures since they need proper vertex color/weighting for effects
+           const bool isParticleTexture = lookupHash(RtxOptions::particleTextures(), textureHash);
+-          if (isExplicitlyAllowed || isDecalTexture || isParticleTexture) {
++          if (isUnitySession() || isExplicitlyAllowed || isDecalTexture || isParticleTexture) {
+             targetBuffer = &geoData.color0Buffer;
+           }
+         }
+@@ -349,7 +351,7 @@ namespace dxvk {
+     DrawCallTransforms& transformData = m_activeDrawCallState.transformData;
+ 
+     // When games use vertex shaders, the object to world transforms can be unreliable, and so we can ignore them.
+-    const bool useObjectToWorldTransform = !m_parent->UseProgrammableVS() || (m_parent->UseProgrammableVS() && useVertexCapture() && useWorldMatricesForShaders());
++    const bool useObjectToWorldTransform = !m_parent->UseProgrammableVS() || (shouldCaptureVertices() && useWorldMatricesForShaders());
+     transformData.objectToWorld = useObjectToWorldTransform ? d3d9State().transforms[GetTransformIndex(D3DTS_WORLD)] : Matrix4();
+ 
+     transformData.worldToView = d3d9State().transforms[GetTransformIndex(D3DTS_VIEW)];
+@@ -436,16 +438,7 @@ namespace dxvk {
+       }
+     }
+ 
+-    // NV-DXVK start: Preserve Unity's generated waves and reflection shader after the RT scene.
+-    if (m_parent->UseProgrammableVS() && m_parent->UseProgrammablePS() &&
+-        checkBoundTextureCategory(proceduralWaterTextures()) &&
+-        d3d9State().renderTargets[kRenderTargetIndex] != nullptr && m_activePresentParams.has_value() &&
+-        isRenderTargetPrimary(*m_activePresentParams, GetCommonTexture(d3d9State().renderTargets[kRenderTargetIndex]->GetBaseTexture())->Desc())) {
+-      return { RtxGeometryStatus::Rasterized, true };
+-    }
+-    // NV-DXVK end
+-
+-    if (m_parent->UseProgrammableVS() && !useVertexCapture()) {
++    if (m_parent->UseProgrammableVS() && !shouldCaptureVertices()) {
+       ONCE(Logger::info("[RTX-Compatibility-Info] Skipping draw call with shader usage as vertex capture is not enabled."));
+       return { RtxGeometryStatus::Ignored, false };
+     }
+@@ -596,7 +589,7 @@ namespace dxvk {
+       return true;
+     }
+     // NV-DXVK end
+-    if (!m_parent->UseProgrammableVS() && orthographicIsUI()) {
++    if (!isUnitySession() && !m_parent->UseProgrammableVS() && orthographicIsUI()) {
+       // Here we assume drawcalls with an orthographic projection are UI calls (as this pattern is common, and we can't raytrace these objects).
+       const bool isOrthographic = (d3d9State().transforms[GetTransformIndex(D3DTS_PROJECTION)][3][3] == 1.0f);
+       const bool zWriteEnabled = d3d9State().renderStates[D3DRS_ZWRITEENABLE];
+@@ -609,6 +602,70 @@ namespace dxvk {
+     return checkBoundTextureCategory(RtxOptions::uiTextures());
+   }
+ 
++  // NV-DXVK start: Capture Unity world shaders without turning subsequent world draws into overlays.
++  bool D3D9Rtx::isUnitySession() const {
++    return m_parent->GetDXVKDevice()->getCommon()->getImgui().usesUnityLegacyTextures();
++  }
++
++  bool D3D9Rtx::shouldCaptureVertices() const {
++    return m_parent->UseProgrammableVS() && (useVertexCapture() || isUnitySession());
++  }
++
++  bool D3D9Rtx::shaderUsesVertexColor() const {
++    if (!m_parent->UseProgrammablePS()) {
++      return false;
++    }
++    const auto& inputs = d3d9State().pixelShader->GetCommonShader()->GetIsgn();
++    for (uint32_t i = 0; i < inputs.elemCount; ++i) {
++      if (inputs.elems[i].semantic.usage == DxsoUsage::Color && inputs.elems[i].semantic.usageIndex == 0) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  bool D3D9Rtx::registerUnityWater(uint64_t hash, const UnityWaterMaterial& material) {
++    for (auto it = m_unityWaterMaterials.begin(); it != m_unityWaterMaterials.end();) {
++      if (m_reflexFrameId - it->second.frame > 600) {
++        it = m_unityWaterMaterials.erase(it);
++      } else {
++        ++it;
++      }
++    }
++    if (m_unityWaterMaterials.size() >= 2048 && m_unityWaterMaterials.find(hash) == m_unityWaterMaterials.end()) {
++      return false;
++    }
++    m_unityWaterMaterials[hash] = { material, m_reflexFrameId };
++    return true;
++  }
++
++  bool D3D9Rtx::findUnityWaterMaterial() {
++    m_activeDrawCallState.unityWaterMaterial.reset();
++    if (!isUnitySession() || !m_parent->UseProgrammablePS()) {
++      return false;
++    }
++    const uint32_t usedTextures = m_parent->m_activeTextures & m_parent->m_psShaderMasks.samplerMask;
++    for (uint32_t stage : bit::BitMask(usedTextures)) {
++      auto texture = GetCommonTexture(d3d9State().textures[stage]);
++      if (!texture || texture->GetImage() == nullptr) {
++        continue;
++      }
++      const auto hash = texture->GetImage()->getHash();
++      const auto found = m_unityWaterMaterials.find(hash);
++      if (found != m_unityWaterMaterials.end() && m_reflexFrameId - found->second.frame <= 600) {
++        found->second.frame = m_reflexFrameId;
++        m_activeDrawCallState.unityWaterMaterial = found->second.material;
++        return true;
++      }
++    }
++    if (checkBoundTextureCategory(proceduralWaterTextures())) {
++      m_activeDrawCallState.unityWaterMaterial = UnityWaterMaterial{};
++      return true;
++    }
++    return false;
++  }
++  // NV-DXVK end
++
+   PrepareDrawFlags D3D9Rtx::internalPrepareDraw(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext) {
+     ScopedCpuProfileZone();
+ 
+@@ -630,6 +687,7 @@ namespace dxvk {
+       }
+     }
+ 
++    findUnityWaterMaterial();
+     const auto [status, triggerRtxInjection] = makeDrawCallType(drawContext);
+ 
+     // When raytracing is enabled we want to completely remove the ignored drawcalls from further processing as early as possible
+@@ -741,7 +799,7 @@ namespace dxvk {
+     m_activeDrawCallState.materialData.updateCachedHash();
+ 
+     // For shader based drawcalls we also want to capture the vertex shader output
+-    const bool needVertexCapture = m_parent->UseProgrammableVS() && useVertexCapture();
++    const bool needVertexCapture = shouldCaptureVertices();
+     if (needVertexCapture) {
+       prepareVertexCapture(vertexIndexOffset);
+     }
+@@ -766,14 +824,29 @@ namespace dxvk {
+     m_activeDrawCallState.zEnable = d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_TRUE;
+     
+     // NV-DXVK start: Classify effect draws without reclassifying shared albedo textures.
+-    m_activeDrawCallState.setCategory(InstanceCategories::Sky, checkBoundTextureCategory(RtxOptions::skyBoxTextures()));
+-    m_activeDrawCallState.setCategory(InstanceCategories::AnimatedWater, checkBoundTextureCategory(RtxOptions::animatedWaterTextures()));
++    if (m_activeDrawCallState.unityWaterMaterial.has_value()) {
++      m_activeDrawCallState.removeCategory(InstanceCategories::Sky);
++    } else {
++      m_activeDrawCallState.setCategory(InstanceCategories::Sky, checkBoundTextureCategory(RtxOptions::skyBoxTextures()));
++    }
++    m_activeDrawCallState.setCategory(InstanceCategories::AnimatedWater, m_activeDrawCallState.unityWaterMaterial.has_value() || checkBoundTextureCategory(RtxOptions::animatedWaterTextures()));
++    if (isUnitySession() && !m_activeDrawCallState.unityWaterMaterial.has_value() &&
++        m_activeDrawCallState.testCategoryFlags(InstanceCategories::AnimatedWater)) {
++      const uint32_t tint = m_activeDrawCallState.materialData.tFactor;
++      UnityWaterMaterial water;
++      water.transmittance = Vector3(float((tint >> 16) & 255), float((tint >> 8) & 255), float(tint & 255)) / 255.0f;
++      m_activeDrawCallState.unityWaterMaterial = water;
++    }
+     // NV-DXVK end
+ 
+     // Now that the DrawCallState is complete, we can use heuristics for detection
+     m_activeDrawCallState.setupCategoriesForHeuristics(m_seenCameraPositionsPrev.size(),
+                                                        m_seenCameraPositions);
+ 
++    if (m_activeDrawCallState.unityWaterMaterial.has_value()) {
++      m_activeDrawCallState.removeCategory(InstanceCategories::Sky);
++    }
++
+     if (RtxOptions::fogIgnoreSky() && m_activeDrawCallState.categories.test(InstanceCategories::Sky)) {
+       m_activeDrawCallState.fogState.mode = D3DFOG_NONE;
+     }
+@@ -1054,7 +1127,7 @@ namespace dxvk {
+     };
+ 
+     // Currently we only support 2 textures
+-    constexpr uint32_t NumTexcoordBins = FixedFunction ? (D3DDP_MAXTEXCOORD * LegacyMaterialData::kMaxSupportedTextures) : LegacyMaterialData::kMaxSupportedTextures;
++    constexpr uint32_t NumTexcoordBins = FixedFunction ? (D3DDP_MAXTEXCOORD * LegacyMaterialData::kMaxSupportedTextures) : caps::MaxTexturesPS;
+ 
+     bool useStageTextureFactorBlending = true;
+     bool useMultipleStageTextureFactorBlending = false;
+@@ -1189,13 +1262,32 @@ namespace dxvk {
+     // Find the ideal textures for raytracing, initialize the data to invalid (out of range) to unbind unused textures
+     uint32_t firstStage = 0;
+     for (uint32_t idx = 0, textureID = 0; idx < NumTexcoordBins && textureID < LegacyMaterialData::kMaxSupportedTextures; idx++) {
+-      const uint8_t stage = FixedFunction ? texcoordIndexToStage[idx] : textureID;
++      const uint8_t stage = FixedFunction ? texcoordIndexToStage[idx] : idx;
+       if (stage == kInvalidStage || d3d9State().textures[stage] == nullptr)
+         continue;
+ 
+       D3D9CommonTexture* pTexInfo = GetCommonTexture(d3d9State().textures[stage]);
+       assert(pTexInfo != nullptr);
+ 
++      // NV-DXVK start: Shader sampler slots are sparse; wave maps and reflection cubes are not albedo.
++      if constexpr (!FixedFunction) {
++        if ((m_parent->m_psShaderMasks.samplerMask & (1u << stage)) == 0) {
++          continue;
++        }
++        const auto hash = pTexInfo->GetImage()->getHash();
++        if (m_activeDrawCallState.unityWaterMaterial.has_value()) {
++          if (textureID != 0 || (m_unityWaterMaterials.find(hash) == m_unityWaterMaterials.end() &&
++              proceduralWaterTextures().find(hash) == proceduralWaterTextures().end())) {
++            continue;
++          }
++        } else if (pTexInfo->GetType() != D3DRTYPE_TEXTURE &&
++                   !checkBoundTextureCategory(RtxOptions::skyBoxTextures())) {
++          continue;
++        }
++        firstStage = textureID == 0 ? stage : firstStage;
++      }
++      // NV-DXVK end
++
+       // Send the texture stage state for first texture slot (or 0th stage if no texture)
+       if (textureID == 0) {
+         // ColorTexture2 is optional and currently only used as RayPortal material, the material type will be checked in the submitDrawState.
+@@ -1238,6 +1330,22 @@ namespace dxvk {
+     setTextureStageState(d3d9State(), firstStage, useStageTextureFactorBlending, useMultipleStageTextureFactorBlending,
+                          m_activeDrawCallState.materialData, m_activeDrawCallState.transformData);
+ 
++    // NV-DXVK start: Programmable samplers do not inherit fixed-function combiner or UV-stage state.
++    if constexpr (!FixedFunction) {
++      if (isUnitySession()) {
++        auto& material = m_activeDrawCallState.materialData;
++        material.textureColorArg1Source = RtTextureArgSource::Texture;
++        const bool usesColor = shaderUsesVertexColor();
++        material.textureColorArg2Source = usesColor ? RtTextureArgSource::VertexColor0 : RtTextureArgSource::None;
++        material.textureColorOperation = usesColor ? DxvkRtTextureOperation::Modulate : DxvkRtTextureOperation::SelectArg1;
++        material.textureAlphaArg1Source = RtTextureArgSource::Texture;
++        material.textureAlphaArg2Source = usesColor ? RtTextureArgSource::VertexColor0 : RtTextureArgSource::None;
++        material.textureAlphaOperation = usesColor ? DxvkRtTextureOperation::Modulate : DxvkRtTextureOperation::SelectArg1;
++        material.isVertexColorBakedLighting = false;
++      }
++    }
++    // NV-DXVK end
++
+     // NV-DXVK start: Unity uses material colors and stage constants as albedo tint.
+     if constexpr (FixedFunction) {
+       if (m_parent->GetDXVKDevice()->getCommon()->getImgui().usesUnityLegacyTextures()) {
+@@ -1268,6 +1376,38 @@ namespace dxvk {
+         preserveTint(stage[DXVK_TSS_COLORARG2], material.textureColorArg2Source);
+         preserveTint(stage[DXVK_TSS_ALPHAARG1], material.textureAlphaArg1Source);
+         preserveTint(stage[DXVK_TSS_ALPHAARG2], material.textureAlphaArg2Source);
++        // Unity's unlit particle pass multiplies texture * vertex color, then
++        // the material tint in a second stage. Preserve both factors.
++        if (firstStage + 1 < caps::TextureStageCount) {
++          const auto& tintStage = d3d9State().textureStages[firstStage + 1];
++          if (tintStage[DXVK_TSS_COLOROP] == D3DTOP_MODULATE &&
++              ((isConstant(tintStage[DXVK_TSS_COLORARG1]) &&
++                (tintStage[DXVK_TSS_COLORARG2] & D3DTA_SELECTMASK) == D3DTA_CURRENT) ||
++               (isConstant(tintStage[DXVK_TSS_COLORARG2]) &&
++                (tintStage[DXVK_TSS_COLORARG1] & D3DTA_SELECTMASK) == D3DTA_CURRENT))) {
++            material.tFactor = tintStage[DXVK_TSS_CONSTANT];
++            // This is an unconditional material tint, not alpha-masked blending.
++            material.isTextureFactorBlend = false;
++            material.multiplyTextureFactorColor = true;
++            material.multiplyTextureFactorAlpha = tintStage[DXVK_TSS_ALPHAOP] == D3DTOP_MODULATE &&
++              ((isConstant(tintStage[DXVK_TSS_ALPHAARG1]) &&
++                (tintStage[DXVK_TSS_ALPHAARG2] & D3DTA_SELECTMASK) == D3DTA_CURRENT) ||
++               (isConstant(tintStage[DXVK_TSS_ALPHAARG2]) &&
++                (tintStage[DXVK_TSS_ALPHAARG1] & D3DTA_SELECTMASK) == D3DTA_CURRENT));
++            if ((stage[DXVK_TSS_COLORARG1] & D3DTA_SELECTMASK) == D3DTA_DIFFUSE) {
++              material.textureColorArg1Source = RtTextureArgSource::VertexColor0;
++            }
++            if ((stage[DXVK_TSS_COLORARG2] & D3DTA_SELECTMASK) == D3DTA_DIFFUSE) {
++              material.textureColorArg2Source = RtTextureArgSource::VertexColor0;
++            }
++            if ((stage[DXVK_TSS_ALPHAARG1] & D3DTA_SELECTMASK) == D3DTA_DIFFUSE) {
++              material.textureAlphaArg1Source = RtTextureArgSource::VertexColor0;
++            }
++            if ((stage[DXVK_TSS_ALPHAARG2] & D3DTA_SELECTMASK) == D3DTA_DIFFUSE) {
++              material.textureAlphaArg2Source = RtTextureArgSource::VertexColor0;
++            }
++          }
++        }
+         material.isVertexColorBakedLighting = false;
+       }
+     }
+@@ -1374,7 +1514,7 @@ namespace dxvk {
+       }
+     }
+ 
+-    m_texcoordIndex = d3d9State().textureStages[firstStage][DXVK_TSS_TEXCOORDINDEX];
++    m_texcoordIndex = FixedFunction ? d3d9State().textureStages[firstStage][DXVK_TSS_TEXCOORDINDEX] : 0;
+ 
+     return true;
+   }
+diff --git a/src/d3d9/d3d9_rtx.h b/src/d3d9/d3d9_rtx.h
+index c57a8ee..1c82d97 100644
+--- a/src/d3d9/d3d9_rtx.h
++++ b/src/d3d9/d3d9_rtx.h
+@@ -8,6 +8,7 @@
+ #include <memory>
+ #include <vector>
+ #include <optional>
++#include <unordered_map>
+ 
+ namespace dxvk {
+   struct D3D9BufferSlice;
+@@ -39,7 +40,7 @@ namespace dxvk {
+ 
+     // NV-DXVK start: Unity Canvas textures are UI only for screen-space depth state.
+     RTX_OPTION("rtx.unity", fast_unordered_set, screenUiTextures, {}, "Unity Canvas textures. Only draws with depth writes off and depth testing disabled or Always are classified as screen UI.");
+-    RTX_OPTION("rtx.unity", fast_unordered_set, proceduralWaterTextures, {}, "Unity procedural water inputs whose original vertex and pixel shaders must be preserved after ray tracing.");
++    RTX_OPTION("rtx.unity", fast_unordered_set, proceduralWaterTextures, {}, "Unity water inputs used to identify displaced geometry for path tracing.");
+     // NV-DXVK end
+     RTX_OPTION("rtx", bool, orthographicIsUI, true, "When enabled, draw calls that are orthographic will be considered as UI.");
+     RTX_OPTION("rtx", bool, preTransformedVerticesIsUI, false, "When enabled, draw calls using pre-transformed (screen-space) vertices will be considered as UI. This is typical for D3D8/D3D9 games that render UI with RHW vertices.");
+@@ -194,6 +195,20 @@ namespace dxvk {
+     }
+ 
+   private: 
++    // NV-DXVK start: Device-owned Unity material metadata; no texture resources retained.
++  public:
++    bool registerUnityWater(uint64_t hash, const UnityWaterMaterial& material);
++  private:
++    struct WaterRegistration {
++      UnityWaterMaterial material;
++      uint64_t frame;
++    };
++    std::unordered_map<uint64_t, WaterRegistration> m_unityWaterMaterials;
++    bool isUnitySession() const;
++    bool shouldCaptureVertices() const;
++    bool shaderUsesVertexColor() const;
++    bool findUnityWaterMaterial();
++    // NV-DXVK end
+     // Reused fixed-size blocks: once allocated, a block is never reallocated, so background
+     // skinning can keep raw Matrix4* into a prior copy. m_blocks can grow, but the heap
+     // Block objects and their `m_matrices` array storage stay pinned. The write cursor
+diff --git a/src/d3d9/d3d9_rtx_geometry.cpp b/src/d3d9/d3d9_rtx_geometry.cpp
+index 4e7e2c1..6ae0f0e 100644
+--- a/src/d3d9/d3d9_rtx_geometry.cpp
++++ b/src/d3d9/d3d9_rtx_geometry.cpp
+@@ -427,7 +427,7 @@ namespace dxvk {
+ 
+     // Assume the GPU changed the data via shaders, include the constant buffer data in hash
+     XXH64_hash_t vertexShaderHash = kEmptyHash;
+-    if (m_parent->UseProgrammableVS() && useVertexCapture()) {
++    if (shouldCaptureVertices()) {
+       if (RtxOptions::geometryHashGenerationRule().test(HashComponents::GeometryDescriptor)) {
+         const D3D9ConstantSets& cb = m_parent->m_consts[DxsoProgramTypes::VertexShader];
+         auto& shaderByteCode = d3d9State().vertexShader->GetCommonShader()->GetBytecode();
+diff --git a/src/dxso/dxso_compiler.cpp b/src/dxso/dxso_compiler.cpp
+index 4582dfb..c28a383 100644
+--- a/src/dxso/dxso_compiler.cpp
++++ b/src/dxso/dxso_compiler.cpp
+@@ -3782,7 +3782,8 @@ void DxsoCompiler::emitControlFlowGenericLoop(
+     const uint32_t wComp = m_module.opCompositeExtract(floatType, viewH, 1, &lit3);
+     const uint32_t invW = m_module.opFDiv(floatType, oneF, wComp);
+ 
+-    const uint32_t view3 = m_module.opVectorShuffle(vec3TypeId, viewH, viewH, 3, lit012);
++    const uint32_t viewNumerator = m_module.opVectorShuffle(vec3TypeId, viewH, viewH, 3, lit012);
++    const uint32_t view3 = m_module.opVectorTimesScalar(vec3TypeId, viewNumerator, invW);
+ 
+     const uint32_t vx = m_module.opCompositeExtract(floatType, view3, 1, &lit0);
+     const uint32_t vy = m_module.opCompositeExtract(floatType, view3, 1, &lit1);
+diff --git a/src/dxvk/rtx_render/rtx_types.h b/src/dxvk/rtx_render/rtx_types.h
+index f22fbdd..0dffb88 100644
+--- a/src/dxvk/rtx_render/rtx_types.h
++++ b/src/dxvk/rtx_render/rtx_types.h
+@@ -746,6 +746,11 @@ namespace fork_hooks {
+                                      XXH64_hash_t& textureHash);
+ }
+ 
++struct UnityWaterMaterial {
++  Vector3 transmittance = Vector3(0.1f, 0.35f, 0.45f);
++  float refractiveIndex = 1.333f;
++};
++
+ struct DrawCallState {
+   DrawCallState() = default;
+   DrawCallState(const DrawCallState& _input) = default;
+@@ -840,6 +845,7 @@ struct DrawCallState {
+   bool zEnable = false;
+ 
+   uint32_t drawCallID = 0;
++  std::optional<UnityWaterMaterial> unityWaterMaterial;
+ 
+   bool isDrawingToRaytracedRenderTarget = false;
+   bool isUsingRaytracedRenderTarget = false;
+diff --git a/src/dxvk/rtx_render/rtx_scene_manager.cpp b/src/dxvk/rtx_render/rtx_scene_manager.cpp
+index acd70f1..a25056a 100644
+--- a/src/dxvk/rtx_render/rtx_scene_manager.cpp
++++ b/src/dxvk/rtx_render/rtx_scene_manager.cpp
+@@ -844,7 +844,12 @@ namespace dxvk {
+         m_device->getCommon()->getTextureManager().getTextureCacheGeneration() ==
+         m_textureCacheGenerationValidForPreserve;
+ 
+-    const XXH64_hash_t legacyMaterialIdentityHash = input.getMaterialData().computeIdentityHash();
++    XXH64_hash_t legacyMaterialIdentityHash = input.getMaterialData().computeIdentityHash();
++    if (input.unityWaterMaterial.has_value()) {
++      const auto& water = input.unityWaterMaterial.value();
++      const float parameters[] = { water.transmittance.x, water.transmittance.y, water.transmittance.z, water.refractiveIndex };
++      legacyMaterialIdentityHash = XXH3_64bits_withSeed(parameters, sizeof(parameters), legacyMaterialIdentityHash);
++    }
+     const bool legacyMaterialIdentityHashMatch =
+         replacementInstance->legacyMaterialIdentityHash == legacyMaterialIdentityHash;
+ 
+@@ -962,6 +967,17 @@ namespace dxvk {
+       return renderMaterialData;
+     }
+ 
++    if (input.unityWaterMaterial.has_value()) {
++      const auto& water = input.unityWaterMaterial.value();
++      TranslucentMaterialData material;
++      material.setRefractiveIndex(water.refractiveIndex);
++      material.setTransmittanceColor(water.transmittance);
++      material.setTransmittanceMeasurementDistance(1.0f);
++      material.setEnableEmission(false);
++      material.setEnableThinWalled(false);
++      return MaterialData(material);
++    }
++
+     // Standard legacy material conversion
+     return input.getMaterialData().as<OpaqueMaterialData>();
+   }
+diff --git a/src/dxvk/rtx_render/rtx_remix_api.cpp b/src/dxvk/rtx_render/rtx_remix_api.cpp
+index bf40f2c..f610a59 100644
+--- a/src/dxvk/rtx_render/rtx_remix_api.cpp
++++ b/src/dxvk/rtx_render/rtx_remix_api.cpp
+@@ -2709,6 +2709,27 @@ extern "C"
+     return REMIXAPI_ERROR_CODE_SUCCESS;
+   }
+ 
++  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_RegisterUnityWaterMaterial(uint64_t hash, const float* values) {
++    if (hash == 0 || !values) {
++      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
++    }
++    for (uint32_t i = 0; i < 4; ++i) {
++      if (!std::isfinite(values[i])) {
++        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
++      }
++    }
++    auto device = tryAsDxvk();
++    if (!device) {
++      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
++    }
++    auto lock = device->LockDevice();
++    dxvk::UnityWaterMaterial material;
++    material.transmittance = dxvk::Vector3(std::clamp(values[0], 0.0f, 1.0f),
++      std::clamp(values[1], 0.0f, 1.0f), std::clamp(values[2], 0.0f, 1.0f));
++    material.refractiveIndex = std::clamp(values[3], 1.0f, 3.0f);
++    return device->RTX().registerUnityWater(hash, material) ? REMIXAPI_ERROR_CODE_SUCCESS : REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
++  }
++
+   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_EnableUnityLegacyTextures(void) {
+     auto device = tryAsDxvk();
+     if (!device) {
+diff --git a/src/dxvk/rtx_render/rtx_materials.cpp b/src/dxvk/rtx_render/rtx_materials.cpp
+index d70161b..fd5970f 100644
+--- a/src/dxvk/rtx_render/rtx_materials.cpp
++++ b/src/dxvk/rtx_render/rtx_materials.cpp
+@@ -55,7 +55,9 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
+     uint8_t textureAlphaOperation;
+     uint8_t isTextureFactorBlend;
+     uint8_t isVertexColorBakedLighting;
+-    uint8_t padding[7];
++    uint8_t multiplyTextureFactorColor;
++    uint8_t multiplyTextureFactorAlpha;
++    uint8_t padding[5];
+   };
+ 
+   LegacyMaterialIdentityHashData data{};
+@@ -81,6 +83,8 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
+   data.textureAlphaArg2Source = static_cast<uint8_t>(textureAlphaArg2Source);
+   data.textureAlphaOperation = static_cast<uint8_t>(textureAlphaOperation);
+   data.isTextureFactorBlend = isTextureFactorBlend ? 1u : 0u;
++  data.multiplyTextureFactorColor = multiplyTextureFactorColor ? 1u : 0u;
++  data.multiplyTextureFactorAlpha = multiplyTextureFactorAlpha ? 1u : 0u;
+   data.isVertexColorBakedLighting = isVertexColorBakedLighting ? 1u : 0u;
+ 
+   return hashStructByMemory<LegacyMaterialIdentityHashData,
+@@ -107,6 +111,8 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
+       &LegacyMaterialIdentityHashData::textureAlphaOperation,
+       &LegacyMaterialIdentityHashData::isTextureFactorBlend,
+       &LegacyMaterialIdentityHashData::isVertexColorBakedLighting,
++      &LegacyMaterialIdentityHashData::multiplyTextureFactorColor,
++      &LegacyMaterialIdentityHashData::multiplyTextureFactorAlpha,
+       &LegacyMaterialIdentityHashData::padding>(data);
+ }
+ 
+diff --git a/src/dxvk/rtx_render/rtx_materials.h b/src/dxvk/rtx_render/rtx_materials.h
+index 2cf36ff..a2f6975 100644
+--- a/src/dxvk/rtx_render/rtx_materials.h
++++ b/src/dxvk/rtx_render/rtx_materials.h
+@@ -282,7 +282,9 @@ struct RtSurface {
+ 
+     static_assert(static_cast<uint32_t>(TexGenMode::Count) <= 4);
+     textureFlags |= ((static_cast<uint32_t>(texgenMode) & 0x3) << 17);
+-    // textureFlags bits 19-30 unused
++    textureFlags |= multiplyTextureFactorColor ? (1 << 19) : 0;
++    textureFlags |= multiplyTextureFactorAlpha ? (1 << 20) : 0;
++    // textureFlags bits 21-30 unused
+ 
+     writeGPUHelper(data, offset, textureFlags);
+ 
+@@ -339,6 +341,8 @@ struct RtSurface {
+   bool isAnimatedWater = false;
+   bool isClipPlaneEnabled = false;
+   bool isTextureFactorBlend = false;
++  bool multiplyTextureFactorColor = false;
++  bool multiplyTextureFactorAlpha = false;
+   bool isVertexColorBakedLighting = true;
+   // isDecalCategory (fork — 2026-06-18) removed 2026-06-19 with the cloud-shadow
+   // zenith gate that consumed it.
+@@ -1908,6 +1912,8 @@ struct LegacyMaterialData {
+   uint32_t tFactor = 0xffffffff;  // Value for D3DRS_TEXTUREFACTOR, default value of is opaque white
+   D3DMATERIAL9 d3dMaterial = {};
+   bool isTextureFactorBlend = false;
++  bool multiplyTextureFactorColor = false;
++  bool multiplyTextureFactorAlpha = false;
+   bool isVertexColorBakedLighting = true;
+ 
+   void setHashOverride(XXH64_hash_t hash) {
+diff --git a/src/dxvk/rtx_render/rtx_instance_manager.cpp b/src/dxvk/rtx_render/rtx_instance_manager.cpp
+index ce38a0d..35fac89 100644
+--- a/src/dxvk/rtx_render/rtx_instance_manager.cpp
++++ b/src/dxvk/rtx_render/rtx_instance_manager.cpp
+@@ -156,7 +156,7 @@ namespace dxvk {
+   namespace {
+     template<int RtInstanceSize> struct CheckRtInstanceSize {
+       // The second line of the build error should contain the new size of RtInstance in the template argument, i.e. `dxvk::CheckRtInstanceSize<newSize>`
+-      static_assert(RtInstanceSize == 776, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
++      static_assert(RtInstanceSize == 784, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+     };
+     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
+   }
+@@ -1087,6 +1087,8 @@ namespace dxvk {
+         // onto the sun term in the NEE and needs no per-surface geometry test.
+         currentInstance.surface.associatedGeometryHash = drawCall.getHash(RtxOptions::geometryAssetHashRule());
+         currentInstance.surface.isTextureFactorBlend = drawCall.getMaterialData().isTextureFactorBlend;
++        currentInstance.surface.multiplyTextureFactorColor = drawCall.getMaterialData().multiplyTextureFactorColor;
++        currentInstance.surface.multiplyTextureFactorAlpha = drawCall.getMaterialData().multiplyTextureFactorAlpha;
+         currentInstance.surface.isVertexColorBakedLighting = drawCall.getMaterialData().isVertexColorBakedLighting;
+         currentInstance.surface.isMotionBlurMaskOut = currentInstance.testCategoryFlags(InstanceCategories::IgnoreMotionBlur);
+         currentInstance.surface.ignoreTransparencyLayer = currentInstance.testCategoryFlags(InstanceCategories::IgnoreTransparencyLayer);
+diff --git a/src/dxvk/meson.build b/src/dxvk/meson.build
+index b58cd33..c2f60d4 100644
+--- a/src/dxvk/meson.build
++++ b/src/dxvk/meson.build
+@@ -544,7 +544,12 @@ generated_dxvk_shaders = glsl_generator.process(dxvk_shaders)
+ rtx_shaders = custom_target(
+   'rtx_shaders',
+   build_by_default: true,
+-  depend_files: files('shaders/rtx/pass/imgui/unity_ui_alpha.comp.slang'),
++  depend_files: files(
++    'shaders/rtx/pass/imgui/unity_ui_alpha.comp.slang',
++    'shaders/rtx/concept/surface/surface.h',
++    'shaders/rtx/concept/surface_material/opaque_surface_material_interaction.slangh',
++    'shaders/rtx/pass/opacity_micromap/bake_opacity_micromap.comp.slang',
++  ),
+   output: ['_built_shaders.txt'],
+   command: [ python_interpreter ] + rtx_shaders_command_arguments
+ )
+diff --git a/src/dxvk/rtx_render/rtx_opacity_micromap_manager.cpp b/src/dxvk/rtx_render/rtx_opacity_micromap_manager.cpp
+index 9d49c51..2c05078 100644
+--- a/src/dxvk/rtx_render/rtx_opacity_micromap_manager.cpp
++++ b/src/dxvk/rtx_render/rtx_opacity_micromap_manager.cpp
+@@ -289,6 +289,7 @@ namespace dxvk {
+       hashSourceData.textureAlphaArg2Source = instance.surface.textureAlphaArg2Source;
+       hashSourceData.textureAlphaOperation = instance.surface.textureAlphaOperation;
+       hashSourceData.tFactorAlpha = instance.surface.tFactor >> 24;
++      hashSourceData.multiplyTextureFactorAlpha = instance.surface.multiplyTextureFactorAlpha ? 1u : 0u;
+       hashSourceData.textureTransform = instance.surface.textureTransform;
+     }
+ 
+diff --git a/src/dxvk/rtx_render/rtx_opacity_micromap_manager.h b/src/dxvk/rtx_render/rtx_opacity_micromap_manager.h
+index e887bb2..983b4cb 100644
+--- a/src/dxvk/rtx_render/rtx_opacity_micromap_manager.h
++++ b/src/dxvk/rtx_render/rtx_opacity_micromap_manager.h
+@@ -229,7 +229,8 @@ namespace dxvk {
+ 
+     VkOpacityMicromapFormatEXT ommFormat = VK_OPACITY_MICROMAP_FORMAT_4_STATE_EXT;         // 4B
+     uint32_t numTriangles = 0;
+-    uint32_t pad32[2] = {};
++    uint32_t multiplyTextureFactorAlpha = 0;
++    uint32_t pad32 = 0;
+   };
+ 
+   // Static validation to detect any changes that require OmmHashData alignment re-check
+diff --git a/src/dxvk/shaders/rtx/concept/surface/surface.h b/src/dxvk/shaders/rtx/concept/surface/surface.h
+index cc8b091..43be927 100644
+--- a/src/dxvk/shaders/rtx/concept/surface/surface.h
++++ b/src/dxvk/shaders/rtx/concept/surface/surface.h
+@@ -475,6 +475,18 @@ struct Surface
+     set { data13.z = newValue ? packedFlagSet(data13.z, 1 << 14) : packedFlagUnset(data13.z, 1 << 14); }
+   }
+ 
++  property bool multiplyTextureFactorColor
++  {
++    get { return packedFlagGet(data13.z, 1 << 19); }
++    set { data13.z = newValue ? packedFlagSet(data13.z, 1 << 19) : packedFlagUnset(data13.z, 1 << 19); }
++  }
++
++  property bool multiplyTextureFactorAlpha
++  {
++    get { return packedFlagGet(data13.z, 1 << 20); }
++    set { data13.z = newValue ? packedFlagSet(data13.z, 1 << 20) : packedFlagUnset(data13.z, 1 << 20); }
++  }
++
+   property bool eyeUseRadialIrisMask
+   {
+     get { return packedFlagGet(data13.z, 1 << 15); }
+diff --git a/src/dxvk/shaders/rtx/concept/surface_material/opaque_surface_material_interaction.slangh b/src/dxvk/shaders/rtx/concept/surface_material/opaque_surface_material_interaction.slangh
+index ae84348..a50b834 100644
+--- a/src/dxvk/shaders/rtx/concept/surface_material/opaque_surface_material_interaction.slangh
++++ b/src/dxvk/shaders/rtx/concept/surface_material/opaque_surface_material_interaction.slangh
+@@ -763,6 +763,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
+     chooseTextureArgument(textureArg1, surface.textureColorArg1Source, albedo, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
+     chooseTextureArgument(textureArg2, surface.textureColorArg2Source, albedo, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
+     chooseTextureOperationColor(albedo, surface.textureColorOperation, textureArg1, textureArg2);
++    if (surface.multiplyTextureFactorColor) albedo *= tFactor.rgb;
+     // Apply additional texture factor multiplication for multi-stage blending when the current
+     // stage's operations don't already use TFactor (to avoid double multiplication)
+     // Use alpha channel as a mask to control where the texture factor is applied
+@@ -779,6 +780,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
+     chooseTextureArgument(textureArg1, surface.textureColorArg1Source, emissiveColor, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
+     chooseTextureArgument(textureArg2, surface.textureColorArg2Source, emissiveColor, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
+     chooseTextureOperationColor(emissiveColor, surface.textureColorOperation, textureArg1, textureArg2);
++    if (surface.multiplyTextureFactorColor) emissiveColor *= tFactor.rgb;
+     // Apply additional texture factor multiplication for multi-stage blending when the current
+     // stage's operations don't already use TFactor (to avoid double multiplication)
+     // Use alpha channel as a mask to control where the texture factor is applied
+@@ -797,6 +799,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
+     chooseTextureArgument(textureAlphaArg1, surface.textureAlphaArg1Source, opacity, surfaceInteraction.vertexColor.a, tFactor.a, opacity);
+     chooseTextureArgument(textureAlphaArg2, surface.textureAlphaArg2Source, opacity, surfaceInteraction.vertexColor.a, tFactor.a, float(1.0f));
+     chooseTextureOperationAlpha(opacity, surface.textureAlphaOperation, textureAlphaArg1, textureAlphaArg2);
++    if (surface.multiplyTextureFactorAlpha) opacity *= tFactor.a;
+     
+     // Ensure we perform these opacity calculations after the texture operations have been applied to abledo and alpha.
+     calcOpaqueSurfaceMaterialOpacity(
+diff --git a/src/dxvk/shaders/rtx/pass/opacity_micromap/bake_opacity_micromap.comp.slang b/src/dxvk/shaders/rtx/pass/opacity_micromap/bake_opacity_micromap.comp.slang
+index f00b2ad..1c07cba 100644
+--- a/src/dxvk/shaders/rtx/pass/opacity_micromap/bake_opacity_micromap.comp.slang
++++ b/src/dxvk/shaders/rtx/pass/opacity_micromap/bake_opacity_micromap.comp.slang
+@@ -121,6 +121,7 @@ void applyVertexAndTextureOperationsToOpacity(inout float opacity, vec3 albedo,
+     chooseTextureArgument(textureAlphaArg1, surface.textureAlphaArg1Source, opacity, vertexInterpolatedOpacity, tFactorAlpha, opacity);
+     chooseTextureArgument(textureAlphaArg2, surface.textureAlphaArg2Source, opacity, vertexInterpolatedOpacity, tFactorAlpha, float(1.0));
+     chooseTextureOperationAlpha(opacity, surface.textureAlphaOperation, textureAlphaArg1, textureAlphaArg2);
++    if (surface.multiplyTextureFactorAlpha) opacity *= tFactorAlpha;
+ 
+     // Unused
+     float emissiveBlendOverrideInfluence = float(0);
+diff --git a/bridge/src/client/unity_legacy.cpp b/bridge/src/client/unity_legacy.cpp
+index a876d6d..cc91b80 100644
+--- a/bridge/src/client/unity_legacy.cpp
++++ b/bridge/src/client/unity_legacy.cpp
+@@ -6,6 +6,29 @@
+ #include "util_remixapi.h"
+ 
+ extern "C" {
++  DLLEXPORT remixapi_ErrorCode __stdcall UnityRemix_RegisterWaterMaterial(IDirect3DBaseTexture9* pTexture, float r, float g, float b, float ior) {
++    if (!pTexture) { return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS; }
++    const auto type = pTexture->GetType();
++    if (type != D3DRTYPE_TEXTURE && type != D3DRTYPE_CUBETEXTURE) { return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS; }
++    const uint32_t textureId = type == D3DRTYPE_TEXTURE ?
++      static_cast<uint32_t>(bridge_cast<Direct3DTexture9_LSS*>(pTexture)->getId()) :
++      static_cast<uint32_t>(bridge_cast<Direct3DCubeTexture9_LSS*>(pTexture)->getId());
++    auto textureReference = type == D3DRTYPE_TEXTURE ? MakeD3DAutoPtr(bridge_cast<Direct3DTexture9_LSS*>(pTexture)) :
++      MakeD3DAutoPtr(bridge_cast<Direct3DCubeTexture9_LSS*>(pTexture));
++    UID uid = 0;
++    float values[] = { r, g, b, ior };
++    {
++      ClientMessage message(Commands::UnityRemix_RegisterWaterMaterial);
++      uid = message.get_uid();
++      message.send_data(textureId);
++      message.send_data(sizeof(values), values);
++    }
++    WAIT_FOR_SERVER_RESPONSE("UnityRemix_RegisterWaterMaterial", REMIXAPI_ERROR_CODE_GENERAL_FAILURE, uid);
++    auto result = static_cast<remixapi_ErrorCode>(DeviceBridge::get_data());
++    DeviceBridge::pop_front();
++    return result;
++  }
++
+   DLLEXPORT remixapi_ErrorCode __stdcall UnityRemix_TagTextureCategory(IDirect3DBaseTexture9* pTexture, uint32_t category) {
+     if (!pTexture || category > 4) { return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS; }
+     const auto type = pTexture->GetType();
+diff --git a/bridge/src/client/d3d9_lss.def b/bridge/src/client/d3d9_lss.def
+index 574c3fa..0581ac0 100644
+--- a/bridge/src/client/d3d9_lss.def
++++ b/bridge/src/client/d3d9_lss.def
+@@ -25,3 +25,4 @@ EXPORTS
+   UnityRemix_GetRendererInfo
+   UnityRemix_TagUiTexture
+   UnityRemix_TagTextureCategory
++  UnityRemix_RegisterWaterMaterial
+diff --git a/bridge/src/server/main.cpp b/bridge/src/server/main.cpp
+index 497e9e4..a036f7f 100644
+--- a/bridge/src/server/main.cpp
++++ b/bridge/src/server/main.cpp
+@@ -3216,6 +3216,29 @@ void ProcessDeviceCommandQueue() {
+         response.send_data(static_cast<uint32_t>(version >> 32));
+         break;
+       }
++      case UnityRemix_RegisterWaterMaterial:
++      {
++        const uint32_t textureId = DeviceBridge::get_data();
++        void* values = nullptr;
++        const auto valueSize = DeviceBridge::getReaderChannel().data->pull(&values);
++        using RegisterWater = remixapi_ErrorCode (REMIXAPI_CALL*)(uint64_t, const float*);
++        auto registerWater = reinterpret_cast<RegisterWater>(GetProcAddress(ghModule, "remixapi_RegisterUnityWaterMaterial"));
++        remixapi_ErrorCode result = REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
++        auto found = gpD3DResources.find(textureId);
++        if (valueSize == sizeof(float) * 4 && values && registerWater && found != gpD3DResources.end() && found->second &&
++            (found->second->GetType() == D3DRTYPE_TEXTURE || found->second->GetType() == D3DRTYPE_CUBETEXTURE) && remixapi::g_remix.dxvk_GetTextureHash) {
++          uint64_t hash = 0;
++          result = remixapi::g_remix.dxvk_GetTextureHash(reinterpret_cast<IDirect3DTexture9*>(static_cast<IDirect3DBaseTexture9*>(found->second)), &hash);
++          if (result == REMIXAPI_ERROR_CODE_SUCCESS && hash != 0) {
++            result = registerWater(hash, static_cast<const float*>(values));
++          } else if (result == REMIXAPI_ERROR_CODE_SUCCESS) {
++            result = REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
++          }
++        }
++        ServerMessage response(Commands::Bridge_Response, currentUID);
++        response.send_data(static_cast<uint32_t>(result));
++        break;
++      }
+       case UnityRemix_TagUiTexture:
+       case UnityRemix_TagTextureCategory:
+       {
+diff --git a/bridge/src/util/util_commands.h b/bridge/src/util/util_commands.h
+index 414d032..6ec4a58 100644
+--- a/bridge/src/util/util_commands.h
++++ b/bridge/src/util/util_commands.h
+@@ -451,6 +451,7 @@ namespace Commands {
+     RemixApi_GetUIState,
+     RemixApi_SetUIState,
+     UnityRemix_TagTextureCategory,
++    UnityRemix_RegisterWaterMaterial,
+     // NV-DXVK end
+   };
+ 
+@@ -502,6 +503,7 @@ namespace Commands {
+     case UnityRemix_GetRendererInfo: return "UnityRemix_GetRendererInfo";
+     case UnityRemix_TagUiTexture: return "UnityRemix_TagUiTexture";
+     case UnityRemix_TagTextureCategory: return "UnityRemix_TagTextureCategory";
++    case UnityRemix_RegisterWaterMaterial: return "UnityRemix_RegisterWaterMaterial";
+     case RemixApi_GetUIState: return "RemixApi_GetUIState";
+     case RemixApi_SetUIState: return "RemixApi_SetUIState";
+     // NV-DXVK end

@@ -80,9 +80,10 @@ namespace UnityRemix
         // Cache for skinned mesh Remix handles - keyed by Remix mesh hash
         private Dictionary<ulong, IntPtr> skinnedMeshHandles = new Dictionary<ulong, IntPtr>();
         
-        // Deferred destruction queue to prevent flickering (destroy handles after they're no longer in use)
-        private Queue<IntPtr> deferredDestroyQueue = new Queue<IntPtr>();
-        private const int DEFERRED_DESTROY_FRAMES = 3; // Keep handles alive for 3 frames
+        // Native handles owned by the bridge, including scene-scanner meshes.
+        private readonly HashSet<IntPtr> ownedMeshes = new HashSet<IntPtr>();
+        private readonly Dictionary<ulong, int> uploadedSkinnedFrames = new Dictionary<ulong, int>();
+        private readonly Dictionary<ulong, ulong> uploadedSkinnedContent = new Dictionary<ulong, ulong>();
         
         // Track which material each mesh uses (composite mesh key -> material ID)
         private Dictionary<ulong, int> meshToMaterialMap = new Dictionary<ulong, int>();
@@ -357,7 +358,7 @@ namespace UnityRemix
                     meshToMaterialMap[meshKey] = primaryMatId;
                 }
 
-                var surfaces = new RemixAPI.remixapi_MeshInfoSurfaceTriangles[submeshIndices.Count];
+                var surfaces = new List<RemixAPI.remixapi_MeshInfoSurfaceTriangles>(submeshIndices.Count);
                 for (int s = 0; s < submeshIndices.Count; s++)
                 {
                     var surfIndices = submeshIndices[s];
@@ -368,6 +369,7 @@ namespace UnityRemix
                     int targetMatId = (data.SubmeshMaterialIds != null && s < data.SubmeshMaterialIds.Count && data.SubmeshMaterialIds[s] != 0)
                         ? data.SubmeshMaterialIds[s]
                         : (mat != null ? mat.GetInstanceID() : 0);
+                    if (materialManager.IsVolumeProxy(targetMatId)) continue;
 
                     IntPtr materialHandle = IntPtr.Zero;
                     if (targetMatId != 0)
@@ -408,7 +410,7 @@ namespace UnityRemix
                         vertsCount = (ulong)sharedRemixVerts.Length;
                     }
 
-                    surfaces[s] = new RemixAPI.remixapi_MeshInfoSurfaceTriangles
+                    surfaces.Add(new RemixAPI.remixapi_MeshInfoSurfaceTriangles
                     {
                         vertices_values = vertsPtr,
                         vertices_count = vertsCount,
@@ -417,10 +419,11 @@ namespace UnityRemix
                         skinning_hasvalue = 0,
                         skinning_value = new RemixAPI.remixapi_MeshInfoSkinning(),
                         material = materialHandle
-                    };
+                    });
                 }
 
-                GCHandle surfaceArrayHandle = GCHandle.Alloc(surfaces, GCHandleType.Pinned);
+                if (surfaces.Count == 0) return IntPtr.Zero;
+                GCHandle surfaceArrayHandle = GCHandle.Alloc(surfaces.ToArray(), GCHandleType.Pinned);
                 surfaceHandles.Add(surfaceArrayHandle);
 
                 ulong meshHash = data.MeshHash;
@@ -430,7 +433,7 @@ namespace UnityRemix
                     pNext = IntPtr.Zero,
                     hash = meshHash,
                     surfaces_values = surfaceArrayHandle.AddrOfPinnedObject(),
-                    surfaces_count = (uint)surfaces.Length
+                    surfaces_count = (uint)surfaces.Count
                 };
 
                 IntPtr handle;
@@ -446,8 +449,9 @@ namespace UnityRemix
                     return IntPtr.Zero;
                 }
 
+                TrackMesh(handle);
                 meshCache[meshKey] = handle;
-                logger.LogInfo($"Created mesh '{data.MeshName}' with hash: 0x{meshHash:X16} and {surfaces.Length} surfaces");
+                logger.LogInfo($"Created mesh '{data.MeshName}' with hash: 0x{meshHash:X16} and {surfaces.Count} surfaces");
 
                 return handle;
             }
@@ -472,8 +476,15 @@ namespace UnityRemix
             int materialId = 0,
             Color32[] colors = null)
         {
+            if (materialManager.IsVolumeProxy(materialId)) return IntPtr.Zero;
             if (vertices == null || vertices.Length == 0 || triangles == null || triangles.Length == 0)
                 return IntPtr.Zero;
+
+            // The render worker may present the same Unity snapshot many times.
+            // Reuse its mesh instead of allocating GPU buffers for each Present.
+            if (uploadedSkinnedFrames.TryGetValue(meshHash, out int uploadedFrame) && uploadedFrame == frameHash &&
+                skinnedMeshHandles.TryGetValue(meshHash, out IntPtr existingHandle))
+                return existingHandle;
             
             if (triangles.Length % 3 != 0)
             {
@@ -535,9 +546,11 @@ namespace UnityRemix
             
             if (poolData.indexCapacity < triangles.Length)
             {
-                if (poolData.isPinned && poolData.indexCapacity > 0)
+                if (poolData.isPinned)
                 {
+                    poolData.vertexHandle.Free();
                     poolData.indexHandle.Free();
+                    poolData.isPinned = false;
                 }
                 poolData.indices = new uint[triangles.Length];
                 poolData.indexCapacity = triangles.Length;
@@ -577,6 +590,19 @@ namespace UnityRemix
             {
                 materialHandle = materialManager.GetOrCreateMaterial(materialId);
             }
+
+            // Round-robin Unity baking repeats unchanged poses across snapshots.
+            // Hash the final native data, including UVs, colors and material, so
+            // transforms alone never cause geometry and acceleration structures
+            // to be reallocated.
+            ulong contentHash = XXHash64.ComputeHash(poolData.vertices, vertices.Length, (ulong)materialHandle.ToInt64());
+            contentHash = XXHash64.ComputeHash(poolData.indices, triangles.Length, contentHash);
+            if (uploadedSkinnedContent.TryGetValue(meshHash, out ulong previousContent) && previousContent == contentHash &&
+                skinnedMeshHandles.TryGetValue(meshHash, out IntPtr unchangedHandle))
+            {
+                uploadedSkinnedFrames[meshHash] = frameHash;
+                return unchangedHandle;
+            }
             
             // Create mesh
             //logger.LogInfo($"Creating skinned mesh {meshHash} with material: 0x{materialHandle.ToInt64():X}");
@@ -609,6 +635,14 @@ namespace UnityRemix
                 RemixAPI.remixapi_ErrorCode result;
                 lock (apiLock)
                 {
+                    // This native branch ignores repeated registrations of a
+                    // hash. Remove the previous geometry BEFORE registering the
+                    // replacement; destroying it afterwards deletes the new mesh.
+                    if (skinnedMeshHandles.TryGetValue(meshHash, out IntPtr previousHandle))
+                    {
+                        ReleaseMesh(previousHandle);
+                        skinnedMeshHandles.Remove(meshHash);
+                    }
                     result = createMeshFunc(ref meshInfo, out handle);
                 }
                 
@@ -617,6 +651,9 @@ namespace UnityRemix
                     return IntPtr.Zero;
                 }
                 
+                TrackMesh(handle);
+                uploadedSkinnedFrames[meshHash] = frameHash;
+                uploadedSkinnedContent[meshHash] = contentHash;
                 return handle;
             }
             finally
@@ -628,7 +665,7 @@ namespace UnityRemix
         /// <summary>
         /// Draw mesh instance with transform
         /// </summary>
-        public void DrawMeshInstance(IntPtr meshHandle, Matrix4x4 localToWorld, uint objectPickingValue)
+        public void DrawMeshInstance(IntPtr meshHandle, Matrix4x4 localToWorld, uint objectPickingValue, bool particle = false)
         {
             if (drawInstanceFunc == null || meshHandle == IntPtr.Zero)
                 return;
@@ -650,14 +687,27 @@ namespace UnityRemix
             };
             
             GCHandle pickingHandle = GCHandle.Alloc(objectPickingExt, GCHandleType.Pinned);
+            GCHandle blendHandle = default;
             
             try
             {
+                if (particle)
+                {
+                    // The material owns blending; this extension preserves simulated
+                    // per-vertex RGB/opacity instead of treating them as baked lighting.
+                    blendHandle = GCHandle.Alloc(new RemixAPI.remixapi_InstanceInfoBlendEXT {
+                        sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT,
+                        pNext = pickingHandle.AddrOfPinnedObject(),
+                        textureColorArg1Source = 1, textureColorArg2Source = 2, textureColorOperation = 3,
+                        textureAlphaArg1Source = 1, textureAlphaArg2Source = 2, textureAlphaOperation = 3,
+                        tFactor = 0xffffffff, alphaTestCompareOp = 7, writeMask = 15
+                    }, GCHandleType.Pinned);
+                }
                 var instanceInfo = new RemixAPI.remixapi_InstanceInfo
                 {
                     sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_INSTANCE_INFO,
-                    pNext = pickingHandle.AddrOfPinnedObject(),
-                    categoryFlags = 0,
+                    pNext = particle ? blendHandle.AddrOfPinnedObject() : pickingHandle.AddrOfPinnedObject(),
+                    categoryFlags = particle ? (1u << 9) : 0,
                     mesh = meshHandle,
                     transform = transform,
                     doubleSided = 1
@@ -676,6 +726,7 @@ namespace UnityRemix
             }
             finally
             {
+                if (blendHandle.IsAllocated) blendHandle.Free();
                 pickingHandle.Free();
             }
         }
@@ -696,6 +747,7 @@ namespace UnityRemix
             int materialId,
             Color32[] colors = null)
         {
+            if (materialManager.IsVolumeProxy(materialId)) return IntPtr.Zero;
             if (vertices == null || vertices.Length == 0 || triangles == null || triangles.Length == 0)
                 return IntPtr.Zero;
             
@@ -901,26 +953,32 @@ namespace UnityRemix
         /// </summary>
         public void UpdateSkinnedMeshHandle(ulong meshHash, IntPtr newHandle)
         {
-            // Queue old handle for deferred destruction (prevents flickering)
-            if (skinnedMeshHandles.TryGetValue(meshHash, out IntPtr oldHandle) && oldHandle != IntPtr.Zero)
-            {
-                // Don't destroy immediately - queue it for later
-                deferredDestroyQueue.Enqueue(oldHandle);
-                
-                // Process deferred destruction queue (destroy oldest handles)
-                while (deferredDestroyQueue.Count > DEFERRED_DESTROY_FRAMES && destroyMeshFunc != null)
-                {
-                    IntPtr handleToDestroy = deferredDestroyQueue.Dequeue();
-                    try
-                    {
-                        destroyMeshFunc(handleToDestroy);
-                    }
-                    catch { }
-                }
-            }
-            
+            if (newHandle == IntPtr.Zero) return;
+            if (skinnedMeshHandles.TryGetValue(meshHash, out IntPtr oldHandle) && oldHandle != newHandle)
+                ReleaseMesh(oldHandle);
+            TrackMesh(newHandle);
             skinnedMeshHandles[meshHash] = newHandle;
             skinnedRenderCount++;
+        }
+
+        // All scene-scanner and frame-capture meshes share one owner. A hash
+        // may be returned multiple times, but is released exactly once.
+        public void TrackMesh(IntPtr handle)
+        {
+            if (handle != IntPtr.Zero) ownedMeshes.Add(handle);
+        }
+
+        private void ReleaseMesh(IntPtr handle)
+        {
+            if (handle == IntPtr.Zero || !ownedMeshes.Contains(handle)) return;
+            if (destroyMeshFunc != null)
+            {
+                RemixAPI.remixapi_ErrorCode result;
+                lock (apiLock) { result = destroyMeshFunc(handle); }
+                if (result != RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
+                    throw new InvalidOperationException($"DestroyMesh failed: {result}");
+            }
+            ownedMeshes.Remove(handle);
         }
         
         /// <summary>
@@ -936,7 +994,7 @@ namespace UnityRemix
             {
                 if (!activeMeshHashes.Contains(kvp.Key))
                 {
-                    destroyMeshFunc(kvp.Value);
+                    ReleaseMesh(kvp.Value);
                     toRemove.Add(kvp.Key);
                 }
             }
@@ -944,6 +1002,13 @@ namespace UnityRemix
             foreach (ulong id in toRemove)
             {
                 skinnedMeshHandles.Remove(id);
+                uploadedSkinnedFrames.Remove(id);
+                uploadedSkinnedContent.Remove(id);
+                if (pinnedMeshPool.TryGetValue(id, out var pool))
+                {
+                    if (pool.isPinned) { pool.vertexHandle.Free(); pool.indexHandle.Free(); }
+                    pinnedMeshPool.Remove(id);
+                }
             }
         }
         
@@ -1118,23 +1183,12 @@ namespace UnityRemix
             pinnedMeshPool.Clear();
             loggedMaterialWarnings.Clear();
             
-            // Destroy any remaining deferred handles
-            if (destroyMeshFunc != null)
-            {
-                while (deferredDestroyQueue.Count > 0)
-                {
-                    IntPtr handle = deferredDestroyQueue.Dequeue();
-                    try
-                    {
-                        destroyMeshFunc(handle);
-                    }
-                    catch { }
-                }
-            }
-            
-            // Note: Mesh cache handles are managed by Remix, don't destroy here
+            foreach (var handle in new List<IntPtr>(ownedMeshes)) ReleaseMesh(handle);
             meshCache.Clear();
             skinnedMeshHandles.Clear();
+            uploadedSkinnedFrames.Clear();
+            uploadedSkinnedContent.Clear();
+            meshToMaterialMap.Clear();
         }
     }
 }

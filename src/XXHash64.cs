@@ -36,6 +36,14 @@ namespace UnityRemix
             }
         }
 
+        public static unsafe ulong ComputeHash<T>(T[] data, int count, ulong seed = 0) where T : unmanaged
+        {
+            if (data == null || count < 0 || count > data.Length)
+                throw new ArgumentOutOfRangeException(nameof(count));
+            fixed (T* pointer = data)
+                return ComputeHash((byte*)pointer, checked(count * sizeof(T)), seed);
+        }
+
         private static unsafe ulong ComputeHash(byte* data, int length, ulong seed)
         {
             byte* end = data + length;

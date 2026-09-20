@@ -1,0 +1,55 @@
+diff --git a/src/dxvk/meson.build b/src/dxvk/meson.build
+--- a/src/dxvk/meson.build
++++ b/src/dxvk/meson.build
+@@ -544,6 +544,8 @@ generated_dxvk_shaders = glsl_generator.process(dxvk_shaders)
+ rtx_shaders = custom_target(
+   'rtx_shaders',
+   build_by_default: true,
++  # The shader compiler tracks its own per-shader include dependencies.
++  build_always_stale: true,
+   depend_files: files(
+     'shaders/rtx/pass/imgui/unity_ui_alpha.comp.slang',
+     'shaders/rtx/concept/surface/surface.h',
+diff --git a/src/dxvk/rtx_render/rtx_debug_view.cpp b/src/dxvk/rtx_render/rtx_debug_view.cpp
+index 9287feb..2fd101e 100644
+--- a/src/dxvk/rtx_render/rtx_debug_view.cpp
++++ b/src/dxvk/rtx_render/rtx_debug_view.cpp
+@@ -89,6 +89,7 @@ namespace dxvk {
+         {DEBUG_VIEW_TEXCOORD_GENERATION_MODE, "Texture Coordinates Generation Mode"},
+         {DEBUG_VIEW_VIRTUAL_MOTION_VECTOR, "Virtual Motion Vector"},
+         {DEBUG_VIEW_SCREEN_SPACE_MOTION_VECTOR, "Screen-Space Motion Vector"},
++        {DEBUG_VIEW_SCREEN_SPACE_MOTION_VECTOR_SIGNED, "Signed Motion Vector (RG: 0.5 = stationary, +/-6.25% screen)"},
+         {DEBUG_VIEW_TRIANGLE_NORMAL, "Triangle Normal"},
+         {DEBUG_VIEW_INTERPOLATED_VERTEX_NORMAL, "Interpolated Vertex Normal"},
+         {DEBUG_VIEW_GEOMETRY_NORMAL, "Geometry Normal"},
+diff --git a/src/dxvk/shaders/rtx/pass/debug_view/debug_view.comp.slang b/src/dxvk/shaders/rtx/pass/debug_view/debug_view.comp.slang
+index 61f400b..5f7ca82 100644
+--- a/src/dxvk/shaders/rtx/pass/debug_view/debug_view.comp.slang
++++ b/src/dxvk/shaders/rtx/pass/debug_view/debug_view.comp.slang
+@@ -321,6 +321,11 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
+   case DEBUG_VIEW_SCREEN_SPACE_MOTION_VECTOR:
+     value = vec4(abs(PrimaryScreenSpaceMotionVector[threadId].xy), 0, 1);
+     break;
++  // NV-DXVK start: Preserve direction and remove DLSS input-resolution dependence.
++  case DEBUG_VIEW_SCREEN_SPACE_MOTION_VECTOR_SIGNED:
++    value = vec4(0.5 + 8.0 * PrimaryScreenSpaceMotionVector[threadId].xy / vec2(cb.camera.resolution), 0, 1);
++    break;
++  // NV-DXVK end
+   case DEBUG_VIEW_WHITE_NOISE:
+     value = vec4(vec3(whiteNoiseValue), 1.0f);
+     break;
+diff --git a/src/dxvk/shaders/rtx/utility/debug_view_indices.h b/src/dxvk/shaders/rtx/utility/debug_view_indices.h
+index fb1243e..2f26910 100644
+--- a/src/dxvk/shaders/rtx/utility/debug_view_indices.h
++++ b/src/dxvk/shaders/rtx/utility/debug_view_indices.h
+@@ -333,6 +333,10 @@
+ // seam at the wrap boundary.
+ #define DEBUG_VIEW_CLOUD_NVDF_SDF 879
+ 
++// NV-DXVK start: Resolution-independent signed motion diagnostics for external output.
++#define DEBUG_VIEW_SCREEN_SPACE_MOTION_VECTOR_SIGNED 880
++// NV-DXVK end
++
+ enum class CompositeDebugView : uint32_t {
+   Disabled = 0,
+   FinalRenderWithMaterialProperties,

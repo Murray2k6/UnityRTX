@@ -207,7 +207,6 @@ namespace UnityRemix
             if (!scene.IsValid())
                 return;
 
-            scannedFilterIds.Clear();
             activeScene = scene;
             timeSinceSceneLoad = 0f;
             rescanTimer = 0f;
@@ -245,7 +244,14 @@ namespace UnityRemix
                 return;
             rescanTimer = 0f;
 
-            int queued = ScanScene(activeScene, logDiagnostics: false);
+            int queued = 0;
+            // An additive scene does not replace the previously loaded scenes.
+            for (int i = 0; i < SceneManager.sceneCount; i++)
+            {
+                var scene = SceneManager.GetSceneAt(i);
+                if (scene.IsValid() && scene.isLoaded)
+                    queued += ScanScene(scene, logDiagnostics: false);
+            }
             if (queued > 0)
             {
                 streamingActive = true;
@@ -256,23 +262,15 @@ namespace UnityRemix
         /// <summary>
         /// Called on the render thread each frame. Drains a batch from the queue
         /// and returns the visibility-filtered snapshot built by UpdateVisibility().
-        /// Falls back to currentInstances if UpdateVisibility hasn't run yet.
+        /// New instances wait for a main-thread visibility check before being drawn.
         /// </summary>
         public InstanceData[] GetInstances()
         {
             DrainStreamingBatch();
 
-            var snapshot = Volatile.Read(ref visibleInstances);
-            if (snapshot != null)
-                return snapshot;
-
-            // Fallback: UpdateVisibility hasn't populated visibleInstances yet (e.g. first
-            // frames after drain, before main-thread LateUpdate runs). Return currentInstances
-            // directly so newly streamed geometry isn't invisible for multiple frames.
-            lock (instanceLock)
-            {
-                return currentInstances.Count > 0 ? currentInstances.ToArray() : null;
-            }
+            // An empty snapshot means nothing is drawable, not "draw everything".
+            // Never inspect Unity renderers on this worker thread.
+            return Volatile.Read(ref visibleInstances) ?? Array.Empty<InstanceData>();
         }
 
         /// <summary>
@@ -285,14 +283,7 @@ namespace UnityRemix
             {
                 if (currentInstances.Count == 0)
                 {
-                    Volatile.Write(ref visibleInstances, null);
-                    return;
-                }
-
-                bool anyCulling = scanActiveOnly || useDistanceCulling || useVisibilityCulling;
-                if (!anyCulling)
-                {
-                    Volatile.Write(ref visibleInstances, currentInstances.ToArray());
+                    Volatile.Write(ref visibleInstances, Array.Empty<InstanceData>());
                     return;
                 }
 
@@ -303,23 +294,16 @@ namespace UnityRemix
                 {
                     var instance = currentInstances[i];
 
-                    if (i < instanceRenderers.Count)
-                    {
-                        var renderer = instanceRenderers[i];
-
-                        // Active-only filtering
-                        if (scanActiveOnly)
-                        {
-                            if (renderer == null || !renderer.enabled || !renderer.gameObject.activeInHierarchy)
-                                continue;
-                        }
-
-                        // Visibility culling (only meaningful for active renderers)
-                        if (useVisibilityCulling && renderer != null
-                            && renderer.enabled && renderer.gameObject.activeInHierarchy
-                            && !renderer.isVisible)
-                            continue;
-                    }
+                    if (i >= instanceRenderers.Count) continue;
+                    var renderer = instanceRenderers[i];
+                    // Scanning inactive assets is preloading, not permission to draw
+                    // disabled renderers or alternate scene variants. Keep them cached
+                    // so re-enabling the object works without rescanning the scene.
+                    if (renderer == null || !renderer.enabled || !renderer.gameObject.activeInHierarchy
+                        || renderer.forceRenderingOff)
+                        continue;
+                    if (useVisibilityCulling && !renderer.isVisible)
+                        continue;
 
                     // Distance culling using pre-computed bounds center
                     if (useDistanceCulling)
@@ -332,7 +316,7 @@ namespace UnityRemix
                     visible.Add(instance);
                 }
 
-                Volatile.Write(ref visibleInstances, visible.Count > 0 ? visible.ToArray() : null);
+                Volatile.Write(ref visibleInstances, visible.ToArray());
             }
         }
 
@@ -357,6 +341,7 @@ namespace UnityRemix
             scannedFilterIds.Clear();
             Volatile.Write(ref visibleInstances, null);
             activeScene = default;
+            streamingActive = false;
         }
 
         private int ScanScene(Scene scene, bool logDiagnostics)
@@ -392,7 +377,6 @@ namespace UnityRemix
                 if (renderer == null)
                 {
                     skippedNoRenderer++;
-                    scannedFilterIds.Add(filterId);
                     continue;
                 }
 
@@ -408,7 +392,6 @@ namespace UnityRemix
                 if (mesh == null)
                 {
                     skippedNoMesh++;
-                    scannedFilterIds.Add(filterId);
                     continue;
                 }
 
@@ -416,9 +399,6 @@ namespace UnityRemix
                 // pre-transformed world-space vertices. Each renderer owns a slice of submeshes
                 // at [subMeshStartIndex .. subMeshStartIndex + sharedMaterials.Length).
                 bool isCombinedMesh = mesh.name != null && mesh.name.StartsWith("Combined Mesh");
-
-                // Mark scanned before extraction — even if geometry is empty we won't retry
-                scannedFilterIds.Add(filterId);
 
                 Vector3[] vertices = null;
                 Vector3[] normals = null;
@@ -442,11 +422,13 @@ namespace UnityRemix
 
                 if (vertices == null)
                 {
-                    try
+                    // Non-readable meshes log a Unity error even if the getter returns
+                    // an empty array instead of throwing. Go straight to GPU readback.
+                    if (mesh.isReadable)
                     {
-                        vertices = mesh.vertices;
+                        try { vertices = mesh.vertices; }
+                        catch { }
                     }
-                    catch { }
 
                     if (vertices != null && vertices.Length > 0)
                     {
@@ -537,7 +519,9 @@ namespace UnityRemix
                         matId = materials[sub].GetInstanceID();
                         materialManager.CaptureMaterialTextures(materials[sub], matId);
                     }
-                    surfaces.Add(new SubMeshSurface { Indices = tris, MaterialId = matId });
+                    // Compaction rewrites indices. Never modify the cached batch
+                    // buffer that another renderer may reference.
+                    surfaces.Add(new SubMeshSurface { Indices = isCombinedMesh ? (int[])tris.Clone() : tris, MaterialId = matId });
                 }
 
                 // For combined meshes, compact vertex arrays so each Remix mesh only
@@ -591,6 +575,8 @@ namespace UnityRemix
                     });
                 }
                 queued++;
+                // Empty/unavailable data during loading must remain eligible for rescans.
+                scannedFilterIds.Add(filterId);
             }
 
             if (logDiagnostics || queued > 0)
@@ -666,6 +652,8 @@ namespace UnityRemix
 
         private IntPtr CreateRemixMesh(ScannedMeshData data)
         {
+            data.Surfaces = data.Surfaces.Where(s => !materialManager.IsVolumeProxy(s.MaterialId)).ToArray();
+            if (data.Surfaces.Length == 0) return IntPtr.Zero;
             if (meshHandles.TryGetValue(data.MeshHash, out IntPtr existing))
                 return existing;
 
@@ -808,6 +796,7 @@ namespace UnityRemix
                 }
 
                 meshHandles[data.MeshHash] = handle;
+                meshConverter.TrackMesh(handle);
                 return handle;
             }
             finally
